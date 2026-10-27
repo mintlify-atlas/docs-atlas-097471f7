@@ -1,0 +1,118 @@
+---
+title: "Drift Detection: How TinyDecide Catches API Changes"
+sidebarTitle: "Drift Detection"
+description: "TinyDecide runs two live checks — an audit CUSUM and a deferred per-label test — that detect when your API's behavior shifts after a model ships."
+---
+
+The certificate TinyDecide issues at compile time covers traffic that looks like the calibration sample. It cannot cover what happens after the model ships: your API might change its answers, a new label might appear, or the traffic distribution might shift. Drift detection is the runtime layer that watches for exactly these changes while the local model is live. When a check trips, every call immediately returns to your API — no wrong local answers continue accumulating while the system waits for you to notice.
+
+## The three checks
+
+| Check | Watches | Trips when |
+|---|---|---|
+| **Audit** | The random sample of local answers, re-asked of your API | A CUSUM test finds overall agreement below target. About 2% false alarms over a model's life when agreement sits exactly at target, fewer above it |
+| **Deferred** | Calls your API answers anyway, against the model's guess | Agreement falls far below calibration overall, or for one label far below what the model's own calibrated confidence predicts |
+| **Schema** | Your API's labels | A label appears that the model has never seen |
+
+## The audit check
+
+Every time the local model answers a call, there is a small probability — the `audit` rate, defaulting to 2% — that the same input is also sent to your API in the background. Your users never see this: the local answer is returned immediately; the background call is only used to check agreement.
+
+The audit sample is uniform and independent of the model's confidence. This matters: it is a genuine iid sample of traffic, which is why it can certify agreement — and why calls logged only because the model deferred them are used only for training, never for certifying.
+
+Agreement on the audit sample is tracked by a CUSUM test that watches simultaneously for error rates at 2×, 4×, and 8× the target error rate, with a threshold `h = 9`. When any of the three CUSUM statistics crosses the threshold, the guard trips.
+
+The CUSUM design was chosen specifically to keep false alarms low while catching real changes quickly:
+
+- At audit rate 2%, across a model's full lifetime, the false alarm rate is about 1.8% when agreement sits exactly at the target — and essentially zero when agreement is comfortably above it.
+- The same audit rate catches a 10% local error rate in a median of 82 audits, and a 15% error rate in a median of 41 audits.
+
+The `audit` option accepts any value from 0 to 1:
+
+```js
+const classify = shadow('support', api, {
+  audit: 0.02,   // 2% of local answers are re-checked (default)
+});
+```
+
+## The deferred check
+
+When the local model's confidence is below the certified cutoff, it defers: the call goes to your API anyway. These deferred calls are free to check — your API answers them regardless, so there's no extra cost. TinyDecide compares the model's guess on each deferred call against what your API actually said.
+
+The deferred check runs two tests on this free signal:
+
+**Overall deferred agreement.** A rolling window of up to 400 deferred calls is kept. Once 100 calls have been observed, if the upper bound of the Wilson interval on agreement falls more than `DEFERRED_SLACK = 0.05` (5 percentage points) below the baseline agreement measured at calibration time, the guard trips.
+
+**Per-label deferred agreement.** Each label the model leans toward has its own rolling window of up to 200 deferred calls. Once 20 calls have accumulated for a label, the check compares the observed hit rate against the expected hit rate from the model's own calibrated confidence — adjusted by how well that confidence predicted agreement on calibration. If the observed hits fall more than `LABEL_SLACK = 0.1` (10 percentage points) below expectation, or more than 4 standard deviations below it, the guard trips for that label.
+
+The per-label check is why drift is usually caught by the deferred check before the audit check trips. A change confined to one label — say, your API starts answering `'billing'` differently — is invisible to the overall statistics until many calls accumulate, but the per-label window notices much sooner.
+
+## The schema check
+
+The simplest of the three checks: if your API returns a label the model has never seen, the guard trips immediately. There is nothing the model can say about an unknown label, so the safe response is to route all traffic to your API straight away and start a new compile that includes the new label.
+
+## What happens when the guard trips
+
+Switching to guarded mode is immediate and happens on the main thread. From the moment the guard trips:
+
+<Steps>
+  <Step title="All calls go to your API">
+    The `mode` transitions to `'guarded'`. Every call — including ones the model would have answered with high confidence — goes directly to your API. No local answers are given while the incident is open.
+  </Step>
+  <Step title="The in-flight compile is cancelled">
+    If a compile was running when the guard tripped, it is cancelled and never installed. Its training data straddles the change point, so any model it would have produced would have learned from a mix of old and new API behavior. A compile that started in an older epoch is silently discarded when it finishes.
+  </Step>
+  <Step title="A new compile starts on post-incident answers">
+    New answers are collected starting from the moment of the incident. The compile schedule restarts from zero, using only answers that arrived after the change. `autoCompile.min` (default 2,000) answers are needed before the first post-incident compile runs.
+  </Step>
+  <Step title="The system transitions back to local">
+    Once a compile on post-incident answers produces a model that certifies, it is installed and the mode returns to `'local'`. The guard state is cleared and all three live checks restart fresh.
+  </Step>
+</Steps>
+
+## Guard state persistence
+
+While in guarded mode, TinyDecide writes a `state.json` file to the decision folder:
+
+```text
+.tinydecide/
+  support/
+    state.json    { "guardedSince": 1729776000000 }
+```
+
+This file survives restarts. If the process is killed while in guarded mode, the next startup reads `state.json` and resumes in guarded mode from the same incident timestamp — only answers after that timestamp are used for the recovery compile. Once the guard clears, `state.json` is removed.
+
+## Controlling sensitivity with the audit rate
+
+The `audit` rate is the main knob for trading detection speed against API call savings:
+
+| `audit` rate | Savings on a 60%-local model | Time to catch a large change |
+|---|---|---|
+| `0.01` (1%) | ~59% of API calls saved | Slower — fewer background checks |
+| `0.02` (2%) | ~59% of API calls saved | Default balance |
+| `0.05` (5%) | ~57% of API calls saved | Faster — more background checks |
+| `0.10` (10%) | ~54% of API calls saved | Significantly faster |
+
+The savings formula is `localShare × (1 − auditRate)`: at 60% local and 2% audit, about 58.8% of API calls are avoided net. Increasing the audit rate costs proportionally.
+
+<Warning>
+  Setting `audit: 1.0` means every local answer is also checked with a background API call. This disables net savings entirely — you pay for every local call twice. Use a high audit rate only for a short monitoring window after a known API change, then restore the default.
+</Warning>
+
+## Guard log lines
+
+TinyDecide logs one line when a guard trips, never per call. The three patterns you'll see:
+
+```text
+[tinydecide] support: your API's answers changed for "billing": on calls the model leaned toward "billing" but left to your API, they now agree 9% of the time where the model expected 47%. Every call goes to your API until a model trained on its new answers certifies.
+```
+
+```text
+[tinydecide] support: live agreement on audited calls fell to 91% (last 320 sampled, target 98%). Every call goes to your API until a model trained on its new answers certifies.
+```
+
+```text
+[tinydecide] support: your API returned a label the model has never seen: "escalate". Every call goes to your API until a model trained on its new answers certifies.
+```
+
+After recovery, a normal `compile` install line appears and traffic resumes locally.

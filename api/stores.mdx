@@ -1,0 +1,232 @@
+---
+title: "Stores — Where TinyDecide Keeps Answers and Models"
+sidebarTitle: "Stores"
+description: "The Store interface and the two built-in implementations: memoryStore for browsers and tests, fileStore for Node persistence across restarts."
+---
+
+A store is the persistence layer for `shadow()`. It holds the answer log (every response your API gives), the compiled model, and the guard state. On startup, `shadow()` loads the saved model and state so it can resume exactly where it left off. During a session it appends every new answer and saves the model after each compile.
+
+The default store in Node for a named decision is a `fileStore` under `.tinydecide/<name>/`. In browsers, edge runtimes, workers, and unnamed Node sessions the default is `memoryStore()`. You can pass any object that satisfies the `Store` interface in the `store` option of `shadow()`.
+
+---
+
+## The `Store` interface
+
+Only `append` and `load` are required. All other methods are optional; without `loadModel`/`saveModel`, a restart starts from scratch (which is always safe — TinyDecide relearns from the answer log).
+
+<ParamField path="append" type="(record: AnswerRecord) => void" required>
+  Adds one answer record to the store. Called synchronously on every API response `shadow()` logs. Must not throw; if it does, TinyDecide catches the error, logs an `error` event, and continues without saving that record.
+</ParamField>
+
+<ParamField path="load" type="() => AnswerRecord[] | Promise<AnswerRecord[]>" required>
+  Returns the stored records, oldest first, up to the store's limit. Called at the start of each compile to fetch the training data. May be async.
+</ParamField>
+
+<ParamField path="size" type="number (readonly, optional)">
+  The current number of records in the store. When present, `shadow()` uses this to decide when to trigger the first compile and to report `stats().logged`. When absent, TinyDecide counts appended records itself.
+</ParamField>
+
+<ParamField path="loadModel" type="() => Model | null | Promise<Model | null>" optional>
+  Returns the most recently saved model, or `null` if none exists yet. Called once on startup. When absent, `shadow()` starts in `learning` mode regardless of prior compiles.
+</ParamField>
+
+<ParamField path="saveModel" type="(model: Model, report: Report) => void | Promise<void>" optional>
+  Persists the newly compiled model and its report. Called after a successful compile that clears the cutoff. When absent, the model is kept only in memory for the current session.
+</ParamField>
+
+<ParamField path="loadState" type="() => StoreState | null | Promise<StoreState | null>" optional>
+  Returns the saved guard state, or `null` if the session ended in `local` mode. `StoreState` has one field: `guardedSince: number` (Unix timestamp). When absent, a restart always starts in `learning` mode even if the previous session was guarded.
+</ParamField>
+
+<ParamField path="saveState" type="(state: StoreState | null) => void | Promise<void>" optional>
+  Saves or clears the guard state. Called with a `StoreState` when the guard trips, and with `null` when a post-incident compile succeeds and the session returns to `local` mode.
+</ParamField>
+
+<ParamField path="close" type="() => void | Promise<void>" optional>
+  Releases any resources held by the store (file descriptors, lock files). Called by `decide.close()`. When absent, no teardown is performed.
+</ParamField>
+
+### The `AnswerRecord` interface
+
+Each record in the log has these fields:
+
+<ResponseField name="t" type="number">
+  Unix timestamp (milliseconds) of when the answer was recorded.
+</ResponseField>
+
+<ResponseField name="input" type="unknown">
+  The raw input that was passed to the `Decide` function.
+</ResponseField>
+
+<ResponseField name="choice" type="string">
+  The label that was read from your API's response.
+</ResponseField>
+
+<ResponseField name="probs" type="Record<string, number> | undefined">
+  Per-label probabilities, when your API returned them.
+</ResponseField>
+
+<ResponseField name="group" type="string | undefined">
+  The group key returned by your `group` function, when configured.
+</ResponseField>
+
+<ResponseField name="sample" type="false | undefined">
+  `false` when this record was logged only because the model deferred the call (not an iid traffic sample). Deferred records are used for training but never for calibration or certification. Absent (treated as `true`) for all other records.
+</ResponseField>
+
+---
+
+## `memoryStore()`
+
+```ts
+memoryStore(options?: { limit?: number; records?: AnswerRecord[] }): Store & { readonly records: AnswerRecord[] }
+```
+
+Keeps all answers, the model, and state in memory. The default store outside Node. It is also suitable for tests, for browser deployments where you load a pre-compiled model with `model:` and skip local training, and for multi-instance deployments where you manage the answer log externally.
+
+<ParamField path="limit" type="number" default="100000">
+  Maximum number of records to keep. When the in-memory array grows beyond `limit × 1.25`, it is trimmed to the newest `limit` entries.
+</ParamField>
+
+<ParamField path="records" type="AnswerRecord[]" optional>
+  Seed the store with an existing array of records (e.g. loaded from a database). The store takes a defensive copy trimmed to `limit`.
+</ParamField>
+
+The returned object also exposes a `records` property — the live in-memory array — so you can inspect or export answers at any time.
+
+```js
+import { shadow, memoryStore } from 'tinydecide';
+
+const store = memoryStore({ limit: 10_000 });
+
+const classify = shadow('support', (text) => api.classify(text), { store });
+
+// Later — export answers for a centralized compile:
+console.log(`${store.records.length} answers logged`);
+const snapshot = [...store.records]; // defensive copy
+```
+
+---
+
+## `fileStore()` (Node only)
+
+```ts
+fileStore(dir: string, options?: { limit?: number }): Store & { readonly dir: string }
+```
+
+Keeps one decision in a folder on disk. This is what `shadow('name', api)` uses automatically in Node. Files written:
+
+```
+<dir>/
+  answers.jsonl    your API's recent answers, trimmed to the newest `limit` lines
+  model.tdm        the installed model
+  report.json      the compile report for the installed model
+  state.json       present only while guarded
+  lock             the PID of the process holding the folder
+```
+
+On first use, `fileStore` also writes a `.gitignore` in the **parent** of `dir`:
+
+```
+# created by tinydecide: answers.jsonl holds raw inputs
+*
+```
+
+This keeps raw inputs out of git by default. Delete or modify the file to opt in.
+
+<ParamField path="dir" type="string" required>
+  The folder path. Created with `mkdirSync({ recursive: true })` if it does not exist.
+</ParamField>
+
+<ParamField path="limit" type="number" default="100000">
+  Maximum lines kept in `answers.jsonl`. When the file grows beyond `limit × 1.25` lines, it is trimmed to the newest `limit` lines. The trim is byte-level (no JSON parsing) and writes atomically.
+</ParamField>
+
+The returned object exposes a `dir` property with the resolved folder path.
+
+**Atomic writes**: model and state files are written to a `.pid.tmp` file and then renamed, so a crash mid-write never corrupts an existing model.
+
+**Lock file**: the `lock` file contains the PID of the process that opened the store. A second process that tries to open the same folder throws immediately. See the warning below.
+
+```js
+import { shadow, fileStore } from 'tinydecide';
+
+// Explicit fileStore — useful when you want to control the path:
+const store = fileStore('./data/decisions/support', { limit: 50_000 });
+const classify = shadow('support', (text) => api.classify(text), { store });
+
+// Or simply use a named shadow() in Node — same effect:
+const classify = shadow('support', (text) => api.classify(text));
+//  ↳ uses fileStore('.tinydecide/support') automatically
+```
+
+---
+
+## `readJsonl()` (Node only)
+
+```ts
+readJsonl(
+  path: string,
+  options?: { onSkip?: (line: number) => void }
+): Record<string, unknown>[]
+```
+
+Reads a `.jsonl` or `.jsonl.gz` file and returns an array of parsed objects. Lines that are not valid JSON (e.g. a partial line from a crash mid-write) are silently skipped. Pass `onSkip` to log which line numbers were skipped.
+
+```js
+import { readJsonl, compile, saveModel } from 'tinydecide';
+
+const records = readJsonl('./answers.jsonl', {
+  onSkip: (line) => console.warn(`Skipped malformed line ${line}`),
+});
+
+const { model, report } = await compile(records);
+saveModel('./support.tdm', model);
+```
+
+For `.jsonl.gz` files, the content is decompressed with Node's built-in `zlib.gunzipSync` before parsing.
+
+---
+
+## Implementing a custom store
+
+Any object that satisfies the `Store` interface works. A minimal custom store needs only `append` and `load`:
+
+```js
+import { shadow } from 'tinydecide';
+
+// Example: store answers in a database
+const store = {
+  async append(record) {
+    await db.answers.insert(record);
+  },
+  async load() {
+    return db.answers.findAll({ orderBy: 't', limit: 100_000 });
+  },
+  get size() {
+    return db.answers.count(); // optional but recommended
+  },
+  async loadModel() {
+    const row = await db.models.findLatest();
+    return row ? Model.fromBytes(row.bytes) : null;
+  },
+  async saveModel(model, report) {
+    await db.models.upsert({ bytes: model.toBytes(), report });
+  },
+  async loadState() {
+    return db.state.find('support');
+  },
+  async saveState(state) {
+    if (state) await db.state.upsert('support', state);
+    else await db.state.delete('support');
+  },
+};
+
+const classify = shadow('support', (text) => api.classify(text), { store });
+```
+
+For full details on building a custom store — including multi-instance deployments and centralized answer logging — see [Custom Stores](/guides/custom-store).
+
+<Warning>
+  `fileStore` throws if another process already holds the lock file for that folder. The first process to open the folder keeps it exclusively; subsequent processes receive the error and fall back to `memoryStore` with one log line. This prevents two concurrent trims from racing and losing answers. If you need multiple instances on the same machine to share an answer log, implement a custom store backed by a database or a shared network path instead.
+</Warning>

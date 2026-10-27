@@ -1,0 +1,507 @@
+---
+title: "TypeScript Types Reference for TinyDecide"
+sidebarTitle: "Types"
+description: "Full reference for every TypeScript type and interface exported by TinyDecide: options, events, records, models, reports, and certificates."
+---
+
+TinyDecide ships complete TypeScript types in `types/index.d.ts`. Every exported type and interface is documented below, with the definition from source and a brief explanation of each field. Import them directly from the package — no separate `@types` install is needed.
+
+```ts
+import { shadow, compile, memoryStore } from 'tinydecide';
+import type { ShadowOptions, Report, Certificate, ShadowEvent } from 'tinydecide';
+```
+
+---
+
+## Mode
+
+```ts
+export type Mode = 'learning' | 'local' | 'guarded';
+```
+
+The operating mode of a decision. TinyDecide progresses through these automatically as it compiles models and detects API changes:
+
+- `'learning'` — every call goes to your API; answers are being logged toward the first compile
+- `'local'` — confident calls are answered by the local model in microseconds; the rest still go to your API
+- `'guarded'` — a live check failed or an unknown label appeared; every call goes back to your API until a new compile certifies
+
+---
+
+## Decide\<I, R\>
+
+```ts
+export interface Decide<I, R> {
+  (input: I): Promise<R>;
+  detailed(input: I): Promise<Detailed<R>>;
+  local(input: I): Decision | null;
+  compile(): Promise<Report | null>;
+  readonly ready: Promise<void>;
+  close(): Promise<void>;
+  stats(): Stats;
+  readonly mode: Mode;
+  readonly model: Model | null;
+}
+```
+
+The function returned by `shadow()`. It is callable like your original API function and carries additional methods for observability and control.
+
+| Member | Description |
+|---|---|
+| `(input)` | Call it exactly like your API. Returns a `Promise<R>` with the same value your API would return — either answered locally by the model or by your API. |
+| `detailed(input)` | Like calling the function, but returns a `Detailed<R>` with the value, its source, the label, confidence, and elapsed time. |
+| `local(input)` | Runs the local model synchronously and returns a `Decision`, or `null` before the first model is compiled. The certified cutoff check is **not** applied — check `decision.local` in the result yourself. |
+| `compile()` | Triggers a compile immediately, outside the automatic schedule. Resolves to the `Report`, or `null` if the compile was discarded (e.g. a guard tripped mid-run). |
+| `ready` | A `Promise` that resolves once a persisted model and state have been loaded from the store. Calls made before this resolves go to your API. |
+| `close()` | Stops the compile scheduler and closes the store. Awaits any in-flight compile first. |
+| `stats()` | Returns a `Stats` snapshot — mode, call counts, live agreement, and model metadata. |
+| `mode` | Read-only current `Mode`. |
+| `model` | Read-only current `Model`, or `null` before the first compile. |
+
+---
+
+## Detailed\<R\>
+
+```ts
+export interface Detailed<R> {
+  value: R;
+  source: 'local' | 'api' | 'fallback';
+  choice: string | null;
+  confidence: number | null;
+  ms: number;
+}
+```
+
+The enriched result from `decide.detailed(input)`.
+
+| Field | Description |
+|---|---|
+| `value` | The answer — the same `R` you would get from calling `decide(input)` directly. |
+| `source` | Who produced the answer. `'local'` means the model answered; `'api'` means your API answered; `'fallback'` means your API threw and `fallback: true` was set, so the model filled in. |
+| `choice` | The label string that was read from the response, or `null` when no label could be parsed. |
+| `confidence` | The model's calibrated confidence that it agrees with your API, or `null` when your API answered. |
+| `ms` | Wall-clock time for the call in milliseconds. |
+
+---
+
+## ShadowOptions\<I, R\>
+
+```ts
+export interface ShadowOptions<I = any, R = any> {
+  target?: number;
+  delta?: number;
+  audit?: number;
+  labels?: string[];
+  model?: Model;
+  store?: Store;
+  dir?: string;
+  group?: (input: I) => string | number | null | undefined;
+  choice?: (response: R, labels: string[] | undefined) =>
+    string | { choice: string | null; probs?: Record<string, number> | null } | null | undefined;
+  respond?: (decision: Decision, shape: ResponseShape | null) => R;
+  fallback?: boolean;
+  log?: boolean | ((line: string, event: ShadowEvent) => void);
+  onEvent?: (event: ShadowEvent) => void;
+  autoCompile?: false | {
+    min?: number;
+    growth?: number;
+    maxEvery?: number;
+    window?: number;
+  };
+  compile?: Partial<Omit<CompileOptions, 'target' | 'delta' | 'audit' | 'labels'>>;
+  compiler?: (rows: AnswerRecord[], options: CompileOptions & { background?: boolean }) =>
+    Promise<{ model: Model; report: Report }>;
+  random?: () => number;
+}
+```
+
+All configuration for `shadow()`. Every field is optional. See [Options](/api/options) for defaults, validation rules, and detailed documentation of each field.
+
+---
+
+## Stats
+
+```ts
+export interface Stats {
+  name: string | null;
+  mode: Mode;
+  calls: number;
+  local: number;
+  api: number;
+  fallback: number;
+  audits: number;
+  auditDisagree: number;
+  compiles: number;
+  errors: number;
+  logged: number;
+  share: number;
+  apiCallsSaved: number;
+  live: { sampled: number; agreement: number | null; ci: [number, number] | null };
+  deferred: { checked: number; agreement: number | null; baseline: number | null };
+  model: { labels: number; cutoff: number; expectedShare: number | null; created: string | null } | null;
+}
+```
+
+A point-in-time snapshot of a decision's activity, returned by `decide.stats()`.
+
+| Field | Description |
+|---|---|
+| `name` | The decision name passed to `shadow()`, or `null` for anonymous decisions. |
+| `mode` | The current `Mode`. |
+| `calls` | Total calls since start. |
+| `local` | Calls answered by the local model. |
+| `api` | Calls answered by your API (not counting audits). |
+| `fallback` | Calls answered by the model because your API threw and `fallback: true` was set. |
+| `audits` | Local calls that were also re-sent to your API as background audit checks. |
+| `auditDisagree` | Audits where the model's answer did not match your API's answer. |
+| `compiles` | Number of compiles attempted since start. |
+| `errors` | Non-fatal errors caught internally (logged via `onEvent`). |
+| `logged` | Total answers in the store. |
+| `share` | `local / calls` — fraction of calls answered locally since start. |
+| `apiCallsSaved` | `local - audits` — net API calls avoided. |
+| `live` | Live agreement on the recent audit sample: `sampled` audit calls, `agreement` rate, and the 95% Wilson `ci`. |
+| `deferred` | Agreement on deferred calls (answered by your API anyway, checked free): `checked` count, current `agreement`, and the `baseline` from calibration. |
+| `model` | Metadata about the current model: label count, `cutoff`, `expectedShare` from calibration, and ISO `created` timestamp. `null` before the first compile. |
+
+---
+
+## ShadowEvent
+
+```ts
+export type ShadowEvent =
+  | { type: 'start'; t: number; mode: Mode; min?: number; logged?: number; share?: number; target?: number; since?: number }
+  | { type: 'compile:start'; t: number; rows: number }
+  | { type: 'compile'; t: number; report: Report; recovering: boolean }
+  | { type: 'install'; t: number; share: number; verdict: Verdict; model: Model; report: Report }
+  | { type: 'discard'; t: number; reason: string }
+  | { type: 'guard'; t: number; reason: 'drift' | 'schema'; slice?: 'audit' | 'deferred'; agreement?: number; baseline?: number; sampled?: number; upper?: number; target?: number; label?: string }
+  | { type: 'audit'; t: number; agree: boolean; local: string; api: string }
+  | { type: 'unreadable'; t: number; preview: string }
+  | { type: 'error'; t: number; where: string; error: string };
+```
+
+Every lifecycle event emitted to `onEvent`. All variants carry `t` (Unix timestamp in ms).
+
+<Expandable title="Event variants">
+
+| `type` | When it fires | Extra fields |
+|---|---|---|
+| `start` | Once, when the decision is initialized | `mode`, `min` (learning: answers before first compile), `logged` (answers already in the store), `share` (local model's expected share), `target`, `since` (guarded: when the incident started) |
+| `compile:start` | When a compile begins | `rows` — number of answer rows passed to the compiler |
+| `compile` | When a compile finishes | `report` — the full `Report`; `recovering` — `true` if this compile was triggered after a guard trip |
+| `install` | When a compiled model passes calibration and is installed | `share`, `verdict`, `model`, `report` |
+| `discard` | When a finished compile is thrown away | `reason` — `'closed'` or `'guard tripped during compile'` |
+| `guard` | When the decision switches to `guarded` mode | `reason` (`'drift'` or `'schema'`); for drift: `slice` (`'audit'` or `'deferred'`), `agreement`, `baseline`, `sampled`, `upper`; for schema: `label` |
+| `audit` | After each background audit call resolves | `agree` — whether the model matched your API; `local` — the model's choice; `api` — your API's choice |
+| `unreadable` | The first time a response arrives whose label cannot be parsed | `preview` — the first 120 characters of the response |
+| `error` | A non-fatal internal error was caught | `where` — which step failed; `error` — the error message |
+
+</Expandable>
+
+---
+
+## AnswerRecord
+
+```ts
+export interface AnswerRecord {
+  t: number;
+  input: unknown;
+  choice: string;
+  probs?: Record<string, number>;
+  group?: string;
+  sample?: false;
+}
+```
+
+One logged answer from your API, stored in the answer log and loaded by the compiler.
+
+| Field | Description |
+|---|---|
+| `t` | Unix timestamp (ms) when the answer was recorded. |
+| `input` | The raw input passed to your API. |
+| `choice` | The label returned by your API. |
+| `probs` | Optional label → probability map. When present, the compiler trains on soft labels. |
+| `group` | Optional group identifier (e.g. a conversation ID), used to keep related calls in the same train/calibration/test split. |
+| `sample` | Absent (or `true`) for calls in the random audit sample. `false` for calls that were deferred to your API because the model was not confident — these are used for training but never for certifying. |
+
+---
+
+## Store
+
+```ts
+export interface Store {
+  append(record: AnswerRecord): void;
+  load(): AnswerRecord[] | Promise<AnswerRecord[]>;
+  readonly size?: number;
+  loadModel?(): Model | null | Promise<Model | null>;
+  saveModel?(model: Model, report: Report): void | Promise<void>;
+  loadState?(): StoreState | null | Promise<StoreState | null>;
+  saveState?(state: StoreState | null): void | Promise<void>;
+  close?(): void | Promise<void>;
+}
+```
+
+The persistence interface for answers, the model, and the guarded state. Only `append` and `load` are required. All optional methods may be synchronous or return a `Promise`.
+
+| Method | Description |
+|---|---|
+| `append(record)` | Appends one answer. Called on every API response. Must not throw. |
+| `load()` | Returns all logged answers, oldest first. Called at the start of each compile. |
+| `size` | Optional read-only count of stored answers, used for `stats().logged`. |
+| `loadModel()` | Returns the previously saved model, or `null`. Called once at startup. |
+| `saveModel(model, report)` | Persists the model and its report after a successful compile. |
+| `loadState()` | Returns a `StoreState` if the decision was guarded when it last shut down, or `null`. |
+| `saveState(state)` | Persists `{ guardedSince }` when the guard trips; called with `null` when a new model clears it. |
+| `close()` | Called by `decide.close()` to flush buffers and release locks. |
+
+<Tip>
+  `memoryStore()` and `fileStore(dir)` (Node only) are the built-in implementations. Pass a custom `Store` to keep answers in a database, a shared cache, or any other backend.
+</Tip>
+
+---
+
+## StoreState
+
+```ts
+export interface StoreState { guardedSince: number }
+```
+
+The persisted state written when the decision enters `guarded` mode.
+
+| Field | Description |
+|---|---|
+| `guardedSince` | Unix timestamp (ms) when the guard tripped. On restart, answers logged before this time are excluded from the recovery compile, because they pre-date the API change. |
+
+---
+
+## Verdict
+
+```ts
+export type Verdict = 'ship' | 'marginal' | 'not-worth-it' | 'need-more-data';
+```
+
+The compile's verdict on whether the model is worth deploying:
+
+- `'ship'` — the model passes the agreement target with a meaningful share of calls answered locally
+- `'marginal'` — the model passes but answers too few calls to save much
+- `'not-worth-it'` — the model cannot reach the target even at low confidence thresholds
+- `'need-more-data'` — there are not enough logged answers to run a reliable calibration
+
+---
+
+## CompileOptions
+
+```ts
+export interface CompileOptions {
+  target: number;
+  delta: number;
+  guarantee: 'overall' | 'local';
+  labels?: string[];
+  calib: number;
+  test: number;
+  seed: number;
+  audit: number;
+  d?: number;
+  maxFeatures?: number;
+  onProgress?: (progress: { phase: string; done: number }) => void;
+  signal?: AbortSignal;
+}
+```
+
+Options for `compile()`. All fields have defaults when called via `shadow()`; when calling `compile()` directly they default as shown in [ShadowOptions](/api/options).
+
+| Field | Description |
+|---|---|
+| `target` | Agreement to certify. Default `0.98`. |
+| `delta` | 1 − confidence of the certificate. Default `0.05`. |
+| `guarantee` | `'overall'` counts your API's own answers as agreeing (default). `'local'` certifies agreement on local answers alone. |
+| `labels` | Fixes the label set and order. Required when your API returns probability arrays. |
+| `calib` | Share of rows held out for calibration (certifying the cutoff). Default `0.25`. |
+| `test` | Share of rows held out for the held-out test report. Default `0.1`. |
+| `seed` | Random seed for the split. |
+| `audit` | Audit rate assumed when estimating savings in the report. Default `0.02`. |
+| `d` | Width of each feature's embedding vector. Default `32`. |
+| `maxFeatures` | Maximum number of features kept (most frequent first). Default `200000`. |
+| `onProgress` | Called during training with `{ phase, done }` (0–1). Useful for progress bars. |
+| `signal` | An `AbortSignal` to cancel a running compile. The guard uses this to cancel compiles that straddle an API change. |
+
+---
+
+## TrafficRecord
+
+```ts
+export type TrafficRecord = Record<string, unknown>;
+```
+
+A flexible type for one row passed to `compile()`. The compiler reads the label from `choice`, `label`, `decision`, or `answer` (or an index when `labels` is set). `input` or `text` holds the text; `probs` holds soft label probabilities; `group` holds a group identifier. Unknown fields are ignored.
+
+---
+
+## Report
+
+```ts
+export interface Report {
+  verdict: Verdict;
+  summary: string;
+  labels: string[];
+  target: number;
+  delta: number;
+  guarantee: 'overall' | 'local';
+  rows: { total: number; train: number; calib: number; test: number; skipped: number };
+  features: number;
+  epochs: number;
+  certificate: Certificate;
+  calib: { share: number; localAgreement: number | null; overallAgreement: number | null; rawAgreement: number | null };
+  test: {
+    n: number;
+    share: number;
+    overallAgreement: number;
+    overallCI: [number, number];
+    localAgreement: number | null;
+    localCI: [number, number] | null;
+    rawAgreement: number;
+    int8Flips: number;
+  } | null;
+  whatIf: { target: number; share: number }[];
+  savings: { apiCallsAvoided: number; auditRate: number };
+  temperature: number;
+  bytes: number;
+  latencyUs: number;
+  ms: { train: number; total: number };
+}
+```
+
+The full output of a compile, returned by `decide.compile()` and embedded in `compile` and `install` events.
+
+| Field | Description |
+|---|---|
+| `verdict` | Whether the model is worth shipping. |
+| `summary` | A plain-English one-sentence description of the result. |
+| `labels` | The label set the model was trained on. |
+| `target` | The agreement target used. |
+| `delta` | The delta used. |
+| `guarantee` | `'overall'` or `'local'`. |
+| `rows` | How the logged answers were split: `total`, `train`, `calib`, `test`, and `skipped` (unreadable lines). |
+| `features` | Number of features kept in the model. |
+| `epochs` | Training epochs completed. |
+| `certificate` | The statistical certificate — see `Certificate` below. |
+| `calib` | Calibration-set measurements: `share` of calls answered locally, `localAgreement` on those, `overallAgreement` including deferred calls, and `rawAgreement` before cutoff filtering. |
+| `test` | Held-out test-set measurements with 95% Wilson intervals, or `null` when there were too few rows. `int8Flips` counts predictions that changed after int8 quantization. |
+| `whatIf` | What share would be answered locally at other agreement targets. |
+| `savings` | Estimated API calls avoided per 1,000 calls, at the given `auditRate`. |
+| `temperature` | Fitted temperature for calibrated confidence output. |
+| `bytes` | Model size in bytes. |
+| `latencyUs` | Median inference latency in microseconds on the compile machine. |
+| `ms` | Wall-clock compile times: `train` and `total`. |
+
+---
+
+## Certificate
+
+```ts
+export interface Certificate {
+  target: number;
+  delta: number;
+  guarantee: 'overall' | 'local';
+  n: number;
+  local: number;
+  errors: number;
+  pValue: number;
+  cutoff: number;
+}
+```
+
+The statistical certificate produced by the Learn-Then-Test calibration step.
+
+| Field | Description |
+|---|---|
+| `target` | The agreement target that was certified. |
+| `delta` | The delta (1 − confidence) used. |
+| `guarantee` | Whether the guarantee is `'overall'` or `'local'`. |
+| `n` | Number of calibration rows used. |
+| `local` | How many of those `n` rows were answered locally (margin ≥ cutoff). |
+| `errors` | How many of the `local` answers disagreed with your API. |
+| `pValue` | The p-value of the binomial test. Always ≤ `delta` when the model ships. |
+| `cutoff` | The minimum top-two logit margin for a call to be answered locally. `Infinity` when nothing could be certified. |
+
+---
+
+## Decision
+
+```ts
+export interface Decision {
+  choice: string;
+  index: number;
+  confidence: number;
+  margin: number;
+  local: boolean;
+  probs?: Record<string, number>;
+}
+```
+
+The result of a single inference from the local model, returned by `model.decide()` and `decide.local()`.
+
+| Field | Description |
+|---|---|
+| `choice` | The predicted label string. |
+| `index` | The index of `choice` in `model.labels`. |
+| `confidence` | Calibrated probability (0–1) that the model agrees with your API on this input. |
+| `margin` | The gap between the top two logits. Compared against `model.cutoff` to determine `local`. |
+| `local` | `true` when the `margin` clears the certified cutoff — i.e. this call would be answered locally in a live deployment. |
+| `probs` | Optional label → probability map, present when `{ probs: true }` is passed to `model.decide()`. |
+
+---
+
+## ModelMeta
+
+```ts
+export interface ModelMeta {
+  created?: string;
+  certificate?: Certificate;
+  rows?: { total: number; train: number; calib: number; test: number };
+  expected?: {
+    share: number;
+    localAgreement: number | null;
+    deferred: { n: number; agreement: number | null; ratio: Record<string, number> }
+  };
+  verdict?: Verdict;
+  response?: ResponseShape | null;
+  [key: string]: unknown;
+}
+```
+
+Metadata embedded in a compiled model. Accessible as `model.meta`.
+
+| Field | Description |
+|---|---|
+| `created` | ISO 8601 timestamp of when the model was compiled. |
+| `certificate` | The `Certificate` from calibration. |
+| `rows` | Row counts from the compile split. |
+| `expected` | Calibration-set predictions: expected `share` of calls answered locally, `localAgreement` on those, and `deferred` statistics used by the live drift check. |
+| `verdict` | The compile verdict. |
+| `response` | The `ResponseShape` learned from your API's first readable response, used to mirror local answers in the same format. |
+
+---
+
+## ResponseShape
+
+```ts
+export interface ResponseShape {
+  kind: 'string' | 'object';
+  key?: string;
+  numeric?: boolean;
+  probsKey?: string | null;
+  probsArray?: boolean;
+  confidence?: boolean;
+}
+```
+
+Describes the structure of your API's responses, inferred automatically from the first readable response. Used by `shadow()` to build local answers that match the shape of your API's output.
+
+| Field | Description |
+|---|---|
+| `kind` | `'string'` when your API returns a bare label string; `'object'` when it returns a structured object. |
+| `key` | The object key that holds the label (e.g. `'choice'`, `'label'`, `'decision'`, `'answer'`). |
+| `numeric` | `true` when the label value is a number (index) rather than a string. |
+| `probsKey` | The object key that holds probabilities, or `null` when absent. |
+| `probsArray` | `true` when probabilities are an array (requires `labels` to map them). |
+| `confidence` | `true` when your API includes a `confidence` field — local answers will include it too. |

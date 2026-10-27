@@ -1,0 +1,144 @@
+---
+title: "Deploy TinyDecide in Production"
+sidebarTitle: "Deployment"
+description: "Deploy TinyDecide across single-server, multi-instance, serverless, and container setups with persistence, shared stores, and compiled models."
+---
+
+TinyDecide works in three deployment topologies, each with a different persistence story. A single long-running process gets everything for free. Multiple instances or serverless functions can share a compiled model. Browsers and edge runtimes run from a pre-compiled model with no filesystem at all. This guide covers what to do — and what to watch out for — in each case.
+
+<Tabs>
+  <Tab title="Single Process">
+    For a single long-running Node process, there is nothing to configure. The named decision keeps its answers, model, and state in `.tinydecide/<name>/` and resumes automatically on restart:
+
+    ```js
+    import { shadow } from 'tinydecide';
+
+    // Answers and the model persist in .tinydecide/support/
+    const classify = shadow('support', api);
+    ```
+
+    After 2,000 answers TinyDecide compiles a model in a worker thread. From then on, it recompiles whenever the answer count doubles, and at least every 20,000 answers, always off the main thread.
+
+    **pm2 cluster mode and Node cluster**
+
+    If a process manager runs several copies of your app (`pm2 -i 4`, `cluster.fork()`), only the first worker to open the folder keeps it. The others fall back to memory automatically and log one line:
+
+    ```
+    [tinydecide] support: Error opening .tinydecide/support: .tinydecide/support is in use by process 12345.
+    Use one process per folder, or delete .tinydecide/support/lock if that process is not using it. Answers stay in memory.
+    ```
+
+    The worker that holds the folder compiles and saves the model. When the others restart (after a deploy, for example) they load the saved model immediately from the folder. During their session they log answers in memory only; those answers are not merged back. If that tradeoff matters, use the multi-instance pattern instead.
+  </Tab>
+
+  <Tab title="Multi-Instance / Serverless">
+    Each instance learns independently when they share no state. They can still reach high local-answer rates by pooling their answers:
+
+    <Steps>
+      <Step title="Collect answers centrally">
+        Pass a custom `store` that sends answers to a shared endpoint (a database, object storage, or a small queue). See the [Custom Store](/guides/custom-store) guide for a full walkthrough.
+      </Step>
+
+      <Step title="Compile on a schedule">
+        Run the CLI `compile` command against the shared answer log on a schedule (a cron job, a CI pipeline, or a serverless trigger):
+
+        ```bash
+        npx tinydecide compile answers.jsonl --out support.tdm
+        ```
+
+        The compile prints a verdict, held-out accuracy, and what other targets would allow. The output `.tdm` file is typically 0.2–6 MB.
+      </Step>
+
+      <Step title="Ship the model to your instances">
+        Load the compiled model and pass it to `shadow`. Set `autoCompile: false` so each instance does not try to compile from its own partial answer set:
+
+        ```js
+        import { loadModel, shadow } from 'tinydecide';
+
+        const model = loadModel('support.tdm');
+
+        const classify = shadow('support', api, {
+          model,
+          autoCompile: false,
+          store, // your shared store, so live checks are recorded
+        });
+        ```
+
+        Deploy the `.tdm` file alongside your app, or fetch it at startup from object storage. The live agreement checks still run on every instance and fall back to your API on their own if the model's answers drift.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Browser / Edge">
+    The browser entry (`src/index.js`) has no Node dependencies. Answers stay in memory — there is no filesystem — so they do not persist across page reloads. Load a compiled model at startup to get local answers immediately:
+
+    ```js
+    import { shadow, Model } from 'tinydecide';
+
+    // Fetch the compiled model (produced by `tinydecide compile`) and load it
+    const model = Model.fromBytes(
+      await (await fetch('/support.tdm')).arrayBuffer()
+    );
+
+    const classify = shadow('support', api, {
+      model,
+      autoCompile: false, // no in-browser training
+    });
+    ```
+
+    The `.tdm` file is a static asset. Serve it from your CDN alongside your JS bundle. The model is loaded once per page load; calls that exceed the certified margin still go to your API.
+
+    See the [Browsers & Edge](/guides/browsers-and-edge) guide for Service Worker, Cloudflare Workers, Deno Deploy, and Vercel Edge details.
+  </Tab>
+</Tabs>
+
+## File layout
+
+In Node, each named decision lives in one folder:
+
+```
+.tinydecide/
+  .gitignore          written once: ignores the whole folder (holds raw inputs)
+  support/
+    answers.jsonl     your API's recent answers, trimmed to the newest 100,000
+    model.tdm         the installed model
+    report.json       the compile report for the installed model
+    state.json        present only while guarded; removed when a new model certifies
+    lock              the pid of the process using the folder
+```
+
+| File | Purpose |
+|---|---|
+| `answers.jsonl` | One JSON object per line: the input, choice, timestamp, and optional probs and group. Trimmed to the 100,000 most recent rows. |
+| `model.tdm` | The compiled model in TinyDecide's binary format. Loaded at startup; replaced atomically on each new compile. |
+| `report.json` | The compile report for the installed model: verdict, agreement, feature count, latency estimate, and the full certificate. |
+| `state.json` | Only present while the decision is in `guarded` mode. Lets a restart stay guarded rather than starting from scratch. |
+| `lock` | The PID of the process holding the folder. A second process that tries to open the same folder will throw, log one line, and fall back to memory. |
+
+## Atomic writes and the lock file
+
+Model and state writes are atomic: TinyDecide writes to a `.tmp` file first and then renames it, so a crash mid-write never leaves a partial model on disk. A line cut off in `answers.jsonl` by a crash is skipped on the next load.
+
+The lock file (`lock`) contains the PID of the owning process. If that process is gone (a container restart with the same PID, for example), the lock is treated as stale and overwritten. Only one process may hold a given folder at a time; a second attempt throws immediately rather than waiting.
+
+## Overriding the storage directory
+
+Set `$TINYDECIDE_DIR` to store decisions somewhere other than `.tinydecide/`:
+
+```bash
+TINYDECIDE_DIR=/var/data/decisions node server.js
+```
+
+Or pass it per decision:
+
+```js
+const classify = shadow('support', api, { dir: '/var/data/decisions' });
+```
+
+The environment variable applies to all decisions in the process; the `dir` option overrides it for one decision.
+
+<Warning>
+  The `.tinydecide/` folder holds raw inputs exactly as they were passed to `shadow()`. Keep it private: out of version control (the auto-created `.gitignore` handles this), out of your Docker image, and away from web-accessible paths.
+
+  If your inputs contain sensitive data — PII, health information, credentials — redact them before they reach `shadow()`, or use a custom `store` that sanitises records before saving them. See the [Custom Store](/guides/custom-store) guide for a pattern that strips fields before appending.
+</Warning>

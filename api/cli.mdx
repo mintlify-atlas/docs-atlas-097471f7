@@ -1,0 +1,309 @@
+---
+title: "TinyDecide CLI Reference"
+sidebarTitle: "CLI"
+description: "Reference for the five tinydecide CLI commands: try, status, compile, inspect, and decide — simulate, monitor, build, and run local models."
+---
+
+TinyDecide ships a CLI (`tinydecide`) that lets you simulate the learning loop, check the status of decisions, compile models from answer logs, inspect compiled models, and run inference from the terminal. No API key or configuration file is needed to get started.
+
+## Installation
+
+The CLI is available immediately via `npx`, or globally after installing the package:
+
+```sh
+npx tinydecide <command>
+
+# or install once:
+npm install -g tinydecide
+tinydecide <command>
+```
+
+---
+
+## tinydecide try
+
+Runs a 15-second simulation — no API key needed. TinyDecide wraps a simulated support-ticket classifier with 10 labels, logs its answers, compiles a local model, and then watches the simulated API change its behavior mid-run. The entire learning and guard cycle plays out in your terminal.
+
+**Flags**
+
+<ParamField query="--calls" type="number" default="14000">
+  Total number of simulated API calls to make.
+</ParamField>
+
+<ParamField query="--rate" type="number" default="1000">
+  Simulated calls per second (controls how fast the progress display moves).
+</ParamField>
+
+<ParamField query="--seed" type="number" default="1">
+  Random seed for the simulated API, so the run is reproducible.
+</ParamField>
+
+**Example**
+
+```sh
+npx tinydecide try
+```
+
+**Sample output**
+
+```
+  tinydecide try
+
+  A simulated support-ticket classifier stands in for your API: 10 labels, 400 ms
+  and $0.40 per 1,000 calls (assumed). TinyDecide wraps it. Partway through, the
+  API changes how it labels some messages.
+
+       2,000  learning from your API. First compile after 2,000 answers.
+       2,000  compiled from 2,000 answers: answers 60% of calls locally, with
+              ≥ 98% agreement with your API certified at 95% confidence.
+       7,700  ▸ billing and refunds merged into billing. Nothing tells TinyDecide.
+       8,900  your API's answers changed for "billing": on calls the model leaned
+              toward "billing" but left to your API, they now agree 9% of the time
+              where the model expected 47%. Every call goes to your API until a
+              model trained on its new answers certifies.
+
+  Done. 14,000 calls, 8,421 answered locally (60%).
+
+  agreement          98.4% before the change, 98.1% after the guard (overall, as
+                     certified; checked on every call, which only a simulation can do)
+  the change         caught after 1,226 calls; 47 local answers were wrong in that window
+  API calls saved    7,983  $3.19 and 53 min of waiting, at the assumed price and latency
+  time per answer    9.2 µs locally, vs 400 ms from your API
+
+  Next: wrap your own API
+
+    import { shadow } from 'tinydecide';
+    const classify = shadow('support', (text) => yourApi.classify(text));
+```
+
+---
+
+## tinydecide status \[dir\]
+
+Shows every decision in `.tinydecide/` (or a custom `[dir]`) at a glance — the decision name, its current mode, how many answers have been logged, the share answered locally, and when it was last compiled.
+
+**Arguments**
+
+<ParamField path="dir" type="string">
+  Path to the folder that holds named decisions. Defaults to `.tinydecide` (or `$TINYDECIDE_DIR` if set).
+</ParamField>
+
+**Examples**
+
+```sh
+npx tinydecide status
+npx tinydecide status /path/to/.tinydecide
+```
+
+**Sample output**
+
+```
+  .tinydecide/
+
+  support       local       12,847 answers   answers about 61% locally at ≥ 98% agreement · compiled 3 min ago
+  intent        learning     1,204 answers   every call goes to your API until the first compile
+  sentiment     guarded      8,019 answers   back to your API 12 min ago; relearning from its new answers
+```
+
+**Modes**
+
+Each decision shows one of three modes:
+
+| Mode | Color | Meaning |
+|---|---|---|
+| `learning` | dim | Every call goes to your API; answers are being logged toward the first compile |
+| `local` | blue | Confident calls are answered locally; the rest still go to your API |
+| `guarded` | yellow | A live check failed or a new label appeared; every call goes back to your API until a compile on post-incident answers certifies |
+
+---
+
+## tinydecide compile \<answers\>
+
+Compiles a local model from a `.jsonl` answer log or a decision folder. The output is a `.tdm` file you can pass to `tinydecide inspect`, `tinydecide decide`, or `shadow('name', api, { model: loadModel('support.tdm') })`.
+
+**Arguments**
+
+<ParamField path="answers" type="string" required>
+  Path to a `.jsonl` answer log, or a decision folder such as `.tinydecide/support` (the folder's `answers.jsonl` is used automatically).
+</ParamField>
+
+**Flags**
+
+<ParamField query="--out" type="string">
+  Output path for the compiled model. Defaults to the input path with `.tdm` replacing `.jsonl`.
+</ParamField>
+
+<ParamField query="--target" type="number" default="0.98">
+  Agreement with your API to certify, overall across all calls.
+</ParamField>
+
+<ParamField query="--delta" type="number" default="0.05">
+  1 − confidence of the certificate (e.g. `0.05` = 95% confidence).
+</ParamField>
+
+<ParamField query="--guarantee" type="string" default="overall">
+  `overall` certifies agreement across all calls (your API's own answers count as agreeing). `local` certifies agreement on local answers alone; it answers fewer calls.
+</ParamField>
+
+<ParamField query="--labels" type="string">
+  Comma-separated label list. Fixes label order; required when your API returns probability arrays.
+</ParamField>
+
+<ParamField query="--audit" type="number" default="0.02">
+  Audit rate assumed when estimating savings in the report.
+</ParamField>
+
+<ParamField query="--report" type="string">
+  Write the full compile report as JSON to this path.
+</ParamField>
+
+<ParamField query="--seed" type="number">
+  Random seed for the train/calibration/test split, for reproducibility.
+</ParamField>
+
+**Input format**
+
+Answer logs are `.jsonl` files — one JSON object per line. The minimum required fields are `input` and a label field:
+
+```jsonl
+{"input": "my card was charged twice", "choice": "billing"}
+{"input": "I want to cancel my plan", "choice": "cancellation"}
+{"input": "where is my order?", "choice": "shipping", "probs": {"billing": 0.02, "shipping": 0.95}}
+```
+
+The label may also be under `label`, `decision`, or `answer`. `probs` (a label → probability map) and `group` (a conversation or customer identifier) are optional but improve the model.
+
+**Example**
+
+```sh
+npx tinydecide compile traffic.jsonl --out support.tdm --target 0.98
+```
+
+**Sample output**
+
+```
+  tinydecide compile  traffic.jsonl → traffic.tdm
+
+  10,000 calls · 151 labels · target 98.0% overall agreement (95% confidence)
+
+  ✓ ship   Answers 69.1% of calls locally while keeping overall agreement with your API ≥ 98% (95% confidence).
+
+  held-out check   1,015 calls   69.0% local   98.4% agreement [97.5%–99.0%]
+  local answers    97.7% agree with your API
+  what if          90% → 96%   95% → 83%   97% → 76%   98% → 69%   99.0% → 56%   99.5% → 36%
+  model            0.66 MB · 15,948 features · 11.1 µs per call · trained in 3.5 s
+```
+
+---
+
+## tinydecide inspect \<model.tdm\>
+
+Prints labels, feature count, cutoff, certificate, and expected statistics from a compiled `.tdm` model file.
+
+**Arguments**
+
+<ParamField path="model.tdm" type="string" required>
+  Path to a compiled model file produced by `tinydecide compile` or `saveModel`.
+</ParamField>
+
+**Example**
+
+```sh
+npx tinydecide inspect support.tdm
+```
+
+**Sample output**
+
+```json
+{
+  "labels": [
+    "billing",
+    "cancellation",
+    "shipping",
+    "technical",
+    "account",
+    "refund",
+    "feedback",
+    "other"
+  ],
+  "features": 15948,
+  "d": 32,
+  "bytes": 659456,
+  "temperature": 1.042,
+  "cutoff": 0.847,
+  "certificate": {
+    "target": 0.98,
+    "delta": 0.05,
+    "guarantee": "overall",
+    "n": 2512,
+    "local": 1736,
+    "errors": 31,
+    "pValue": 0.0041,
+    "cutoff": 0.847
+  },
+  "expected": {
+    "share": 0.691,
+    "localAgreement": 0.977,
+    "deferred": {
+      "n": 782,
+      "agreement": 0.931,
+      "ratio": { "billing": 0.98, "cancellation": 0.96 }
+    }
+  },
+  "created": "2025-04-12T10:23:47.000Z"
+}
+```
+
+The `certificate` object contains the statistical guarantee: `n` calibration rows were used, `local` of them were answered locally, `errors` of those disagreed with your API, and the result passed the binomial test with `pValue`. The `cutoff` is the minimum top-two logit margin a call must have to be answered locally.
+
+---
+
+## tinydecide decide \<model.tdm\> \[text…\]
+
+Answers one or more inputs using a compiled model. When no text arguments are given, reads one input per line from stdin.
+
+**Arguments**
+
+<ParamField path="model.tdm" type="string" required>
+  Path to a compiled model file.
+</ParamField>
+
+<ParamField path="text…" type="string">
+  One or more input strings to classify. Omit to read from stdin instead.
+</ParamField>
+
+**Input parsing**
+
+Each input is treated as plain text unless it parses as a JSON object, in which case the parsed object is passed to the model directly (matching how `shadow()` passes structured inputs).
+
+**Output**
+
+Each input produces one line of JSON:
+
+```json
+{"choice": "billing", "confidence": 0.9731, "local": true}
+```
+
+- `choice` — the predicted label
+- `confidence` — calibrated probability that the model agrees with your API
+- `local` — `true` when the margin clears the certified cutoff; `false` when the model is not confident enough to answer locally in a live deployment
+
+**Examples**
+
+```sh
+# Single input as an argument
+npx tinydecide decide support.tdm "my card was charged twice"
+
+# Multiple inputs
+npx tinydecide decide support.tdm "my card was charged twice" "cancel my subscription"
+
+# Pipe from stdin
+echo "cancel my subscription" | npx tinydecide decide support.tdm
+
+# Classify a file, one input per line
+cat inputs.txt | npx tinydecide decide support.tdm
+```
+
+<Note>
+  `tinydecide decide` runs the model synchronously and exits. It does not apply the live agreement checks that `shadow()` runs in a running process. Use it for batch scoring and offline evaluation.
+</Note>

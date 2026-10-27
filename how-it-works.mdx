@@ -1,0 +1,135 @@
+---
+title: "How TinyDecide Trains, Certifies, and Guards Locally"
+sidebarTitle: "How It Works"
+description: "Internals of TinyDecide's pipeline: feature extraction, fastText-style training, int8 quantization, conformal certification, and live drift detection."
+---
+
+This page explains the complete pipeline that TinyDecide runs from the moment your API gives its first answer to the moment a certified local model is answering calls in microseconds. It covers feature extraction, model architecture, the train/calibrate/test split, the conformal-prediction certificate, the autoCompile schedule, and the three live checks that watch for API drift.
+
+## Feature Extraction
+
+Before training, every input is converted into a fixed-length feature vector. The steps are:
+
+1. **Normalization.** Text is Unicode NFKC-normalized and lowercased. This folds compatibility characters and makes the vocabulary stable across encoding variants.
+
+2. **Word tokens.** Word unigrams and bigrams are extracted from the normalized text. Han and kana characters are treated as their own tokens without requiring whitespace boundaries — each character becomes its own unigram.
+
+3. **Number shapes.** Digit sequences are replaced with a shape token (e.g. a run of digits becomes a placeholder), so the model generalizes across specific numbers.
+
+4. **Character n-grams.** Character 2-, 3-, and 4-grams are extracted within each word, giving the model sub-word information that helps with morphological variation and typos.
+
+5. **Pair features.** When the input is a pair `{ a, b }` (for tasks like entailment or paraphrase detection), features get side-aware prefixes (`a:` / `b:`) and overlap features are added for tokens that appear in both sides.
+
+6. **Hashing.** All tokens are hashed to 32-bit integers using a fixed seed. The hash space is large enough that collisions are rare, so no vocabulary lookup is needed at inference time.
+
+## Model Architecture
+
+The local model is a fastText-style linear classifier with one structural refinement: words and characters are pooled into separate embedding bags and then summed into a shared linear head. This gives the model two complementary views — the lexical content from words and the morphological content from characters — without adding depth.
+
+- **Embedding bags.** Word features index one embedding matrix; character features index another. Both are averaged (pooled) across the tokens in their group, then added together before the linear head.
+- **Training.** The model is trained with SGD on your API's soft labels. When your API returns probability distributions (via the `probs` field), those distributions are used as training targets, so the model learns from your API's uncertainty rather than just the top-1 prediction.
+- **Quantization.** After training, weights are quantized to **int8** with one scale per row. Every number in the compile report — agreement, latency, the certificate — is measured on the int8 model that ships. There is no float32 reference model in production.
+- **Temperature.** A scalar temperature is fitted on the calibration rows to make the reported `confidence` match how often your API actually agrees with the model's top prediction. The temperature does not affect the margin cutoff — only the confidence value returned in `decide.detailed()`.
+
+## Training and Compilation
+
+Each compile runs through four phases:
+
+### 1. Split
+
+Rows are split into **train**, **calibration**, and **test** partitions. The split is determined by hashing the `group` field if you provide one, or otherwise the normalized input text. This ensures that repeated inputs — the same message sent twice — always land in the same partition, preventing calibration from being contaminated by training examples.
+
+Calls that the model deferred to your API (logged because the model was not confident enough, not because they were sampled uniformly) are marked `sample: false` and used for training only, never for certifying. Only the uniform random audit sample calibrates.
+
+Default partition sizes: 65% train, 25% calibration, 10% test.
+
+### 2. Train and quantize
+
+The model trains on the train partition, then is quantized to int8. The quantized model is what everything downstream measures.
+
+### 3. Certify
+
+On the calibration rows, TinyDecide runs **Learn-Then-Test** with fixed-sequence binomial testing over a pre-fixed grid of margin cutoffs. The grid runs from 0 to 60 across 601 points on a log scale:
+
+```
+[0, 0.01, 0.013, …, 60]
+```
+
+For each cutoff, it counts how many calibration rows would be answered locally and how many of those disagree with your API. It picks the **loosest cutoff** for which:
+
+> With probability at least 1 − `delta` over the calibration draw, agreement with your API on traffic like the calibration rows is at least `target`.
+
+The cutoff grid is fixed before calibration is observed — this is what Learn-Then-Test requires, and what makes the guarantee valid.
+
+### 4. The margin
+
+**The score is the gap between the top two logits.** A call is answered locally if and only if this margin meets or exceeds the certified cutoff. A high margin means the model is confident the top class is right; a low margin means two classes are close and the call is deferred to your API.
+
+### 5. Report
+
+The test partition provides a held-out measurement of what the certified cutoff actually does on data the model never saw. The report includes local share, overall agreement, Wilson intervals, a `whatIf` table of other targets, and latency measured on the int8 model.
+
+<Tip>
+  Pass `compile: { guarantee: 'local' }` to certify agreement on local answers alone (rather than overall across all calls). This is stricter — it will answer fewer calls — but guarantees that the calls TinyDecide does answer locally agree with your API at the target rate, independent of the API calls it still makes.
+</Tip>
+
+## Size and Latency
+
+The compiled model is small and fast:
+
+- **Size:** 0.2–6 MB per decision, most under 3 MB.
+- **Short texts:** 8–30 µs per call on an M3 Pro.
+- **Pairs (e.g. paraphrase, entailment):** 45–70 µs per call.
+- **Long texts (news articles, a few thousand characters):** ~200 µs per call.
+
+The model is a flat byte array — no heap allocation at inference time. Int8 dot products over pooled embedding bags run with no dynamic dispatch.
+
+## Lifecycle Modes and the autoCompile Schedule
+
+A decision moves through three modes. TinyDecide logs one line per transition, never once per call.
+
+| Mode | Who answers | Trigger to leave |
+|---|---|---|
+| **learning** | Your API, every call | 2,000 answers logged and a compile certifies |
+| **local** | The model when margin ≥ cutoff; your API otherwise | A live check fails, or a new unseen label appears |
+| **guarded** | Your API, every call | A compile on post-incident answers certifies |
+
+### What triggers a compile
+
+The autoCompile schedule is:
+
+```js
+{ min: 2000, growth: 2, maxEvery: 20000, window: 50000 }
+```
+
+- **`min: 2000`** — The first compile runs after at least 2,000 answers are logged.
+- **`growth: 2`** — After that, recompile each time the answer count doubles from the previous compile's row count.
+- **`maxEvery: 20000`** — Recompile at least once every 20,000 new answers, regardless of growth.
+- **`window: 50000`** — Each compile uses only the most recent 50,000 answers.
+
+You can override any of these in the `autoCompile` option, or disable automatic compilation entirely with `autoCompile: false` and call `decide.compile()` yourself.
+
+### Worker threads
+
+In Node, each compile runs in a **worker thread**. Two steps still touch the main thread:
+
+- Reading the answer log at the start of each compile (~45 ms for 100,000 short answers on an M3 Pro; ~0.6 s for 2,000-character inputs).
+- Trimming the log once every 25,000 answers (similar cost).
+
+Everything else — featurizing, training, certifying, quantizing — runs off the main thread.
+
+## Live Drift Detection
+
+After a model is installed, three independent checks watch for API changes:
+
+| Check | What it watches | When it trips |
+|---|---|---|
+| **Audit** | The random `audit`-rate sample of local answers, re-asked of your API | A CUSUM test finds overall agreement below target. About 2% false alarms over a model's life when agreement sits exactly at target; fewer above it |
+| **Deferred** | Calls your API answers anyway (because the model deferred), checked against the model's guess | Agreement falls far below calibration overall, or for one label far below what the model's own calibrated confidence predicts |
+| **Schema** | Your API's returned labels | A label appears that the model has never seen |
+
+When any check trips, the mode switches to **guarded**, any in-flight compile is cancelled (its rows straddle the change and cannot certify), and TinyDecide logs the reason. A compile on answers collected after the change will restore local mode once it certifies.
+
+A compile that was running when the guard tripped is discarded and never installed — its training rows span the boundary between the old behavior and the new one, so it cannot produce a valid certificate.
+
+For the full statistical details of the conformal-prediction certificate, see the [Certification reference](/guarantee/certification).

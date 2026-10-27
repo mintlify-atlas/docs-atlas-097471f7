@@ -1,0 +1,334 @@
+---
+title: "shadow() — Wrap Your Decision API"
+sidebarTitle: "shadow()"
+description: "Wrap any decision function and get a Decide handle back. Accepts an optional name, your api function, and ShadowOptions; returns a certified Decide."
+---
+
+`shadow()` is the main entry point for TinyDecide. Pass it your existing API function and it returns a `Decide` handle with the same call signature — every call still goes to your API until a local model is compiled and certified, then the calls the model is confident about are answered in microseconds with agreement guaranteed.
+
+## Function signature
+
+```ts
+shadow(name: string, api: (input: I) => R | Promise<R>, options?: ShadowOptions): Decide<I, R>
+shadow(api: (input: I) => R | Promise<R>, options?: ShadowOptions): Decide<I, R>
+```
+
+The `name` argument is optional. When you supply it, it appears in log lines and — in Node — becomes the folder name under `.tinydecide/` where answers, the model, and state are persisted across restarts.
+
+## Parameters
+
+<ParamField path="name" type="string" optional>
+  A 1–64 character identifier for the decision: letters, digits, dots, dashes, and underscores (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`). In Node, this is also the sub-folder name inside `.tinydecide/`. Misspelled or out-of-range names throw a `TypeError` at startup.
+</ParamField>
+
+<ParamField path="api" type="(input: I) => R | Promise<R>" required>
+  Your existing decision call. TinyDecide wraps it transparently: every call goes through here while learning, and calls the local model can't handle keep going here after. The function must return either a label string or an object that contains the label under a `choice`, `label`, `decision`, or `answer` key, with an optional `probs` field. For custom response shapes, supply the `choice` option.
+</ParamField>
+
+<ParamField path="options" type="ShadowOptions" optional>
+  Configuration for the shadow session. All fields are optional. See the full list below. Unknown keys or out-of-range values (`target`, `delta`, `audit`) throw a `TypeError` at startup with a message that explains the valid range. For details, see [ShadowOptions](/api/options).
+</ParamField>
+
+### ShadowOptions
+
+<ParamField path="target" type="number" default="0.98">
+  Agreement with your API to certify, measured across all calls. Your API's own answers count as agreeing. Must be between 0 and 1 (exclusive).
+</ParamField>
+
+<ParamField path="delta" type="number" default="0.05">
+  One minus the confidence of the certificate. At `0.05`, the certificate holds with 95% probability over the calibration draw. Must be between 0 and 1 (exclusive).
+</ParamField>
+
+<ParamField path="audit" type="number" default="0.02">
+  Share of calls that are re-asked of your API in the background to check agreement live. A 2% rate means roughly 1 in 50 local answers is verified. Must be between 0 and 1 (inclusive).
+</ParamField>
+
+<ParamField path="labels" type="string[]" optional>
+  Fixes the label set and its order. Required when your API returns probability arrays (so TinyDecide knows which index maps to which label). Also used to name index labels when your API returns a number.
+</ParamField>
+
+<ParamField path="model" type="Model" optional>
+  Starts the session from a pre-compiled model — for example, one built offline with `tinydecide compile` and loaded with `loadModel()`. The model's label order also fixes `labels` when that option is not supplied.
+</ParamField>
+
+<ParamField path="store" type="Store" optional>
+  Where answers, the compiled model, and guard state live. Defaults to a `fileStore` under `.tinydecide/<name>/` for named decisions in Node; falls back to `memoryStore()` elsewhere or when the folder can't be opened. See [Stores](/api/stores).
+</ParamField>
+
+<ParamField path="dir" type="string" optional>
+  Node only. The parent folder for named decisions. Defaults to `.tinydecide` or `$TINYDECIDE_DIR`. Only valid when a `name` is supplied; passing `dir` without a name throws a helpful `TypeError`.
+</ParamField>
+
+<ParamField path="group" type="(input: I) => string | number | null | undefined" optional>
+  Groups related calls (one conversation, one customer) into the same train/calib/test split, so the certificate covers new groups rather than just new messages. Return `null` or `undefined` to skip grouping for a call.
+</ParamField>
+
+<ParamField path="choice" type="(response: R, labels: string[] | undefined) => string | { choice: string | null; probs?: Record<string, number> | null } | null | undefined" optional>
+  Reads the label (and optionally probabilities) from your API's response. Default: a string response is used as-is; object responses are checked for `choice`, `label`, `decision`, and `answer` keys, plus `probs` or `probabilities`. Supply this for any other shape.
+</ParamField>
+
+<ParamField path="respond" type="(decision: Decision, shape: ResponseShape | null) => R" optional>
+  Builds a local answer in the same shape as your API's response. By default, TinyDecide mirrors the response shape it learned from the first readable API answer: a string response gives back `decision.choice`, and an object response gives back the label under the same key with `probs` and `confidence` when the API returned them.
+</ParamField>
+
+<ParamField path="fallback" type="boolean" default="false">
+  When `true`, answers locally if your API throws and a model exists. When `false` (the default), a thrown API error always propagates to the caller.
+</ParamField>
+
+<ParamField path="log" type="boolean | ((line: string, event: ShadowEvent) => void)" default="true">
+  Controls lifecycle logging. `true` uses `console.info` for one-line events (compile, install, guard). `false` silences all output. Pass a function to route events to your own logger. Events are never emitted per-call, only on mode changes.
+</ParamField>
+
+<ParamField path="onEvent" type="(event: ShadowEvent) => void" optional>
+  Receives every lifecycle event as a structured object. Event types: `start`, `compile:start`, `compile`, `install`, `guard`, `discard`, `audit`, `unreadable`, `error`.
+</ParamField>
+
+<ParamField path="autoCompile" type="false | { min?: number; growth?: number; maxEvery?: number; window?: number }" optional>
+  Controls when automatic compiles run. `false` disables automatic compiling — use `decide.compile()` to trigger manually. The object form takes:
+  - `min` (default `2000`): answers before the first compile
+  - `growth` (default `2`): recompile when answers have grown by this factor since the last compile
+  - `maxEvery` (default `20000`): recompile at least every this many new answers regardless of the growth factor
+  - `window` (default `50000`): most recent answers a compile uses
+</ParamField>
+
+<ParamField path="compile" type="Partial<Omit<CompileOptions, 'target' | 'delta' | 'audit' | 'labels'>>" optional>
+  Extra options forwarded to each compile. `target`, `delta`, `audit`, and `labels` are set at the shadow level and cannot be overridden here. See [compile()](/api/compile) for all available fields.
+</ParamField>
+
+---
+
+## Return value — the `Decide` interface
+
+`shadow()` returns a `Decide<I, R>` function. You call it exactly like your original API function — one input in, a `Promise<R>` out.
+
+### Call signature
+
+<ResponseField name="(input)" type="(input: I) => Promise<R>">
+  Calls your API or the local model, depending on the current mode and the model's confidence. In `learning` mode, every call goes to your API. In `local` mode, calls whose margin clears the certified cutoff are answered locally; the rest go to your API. In `guarded` mode, every call goes to your API.
+</ResponseField>
+
+### Methods
+
+<ResponseField name="detailed(input)" type="(input: I) => Promise<Detailed<R>>">
+  Like calling `decide(input)` but returns a full `Detailed<R>` object that includes the value, who answered it, the model's confidence, and how long it took.
+</ResponseField>
+
+<ResponseField name="local(input)" type="(input: I) => Decision | null">
+  Runs the local model synchronously. Returns `null` before any model is available. Ignores the certified cutoff — see the `local` field on `Decision` to check whether the margin would have cleared it. Useful for inspection without committing a mode change.
+</ResponseField>
+
+<ResponseField name="compile()" type="() => Promise<Report | null>">
+  Triggers a compile immediately instead of waiting for the schedule. Returns the `Report`, or `null` if the compile was discarded (e.g. the guard tripped while it was running, or `close()` was called).
+</ResponseField>
+
+<ResponseField name="ready" type="Promise<void>">
+  Resolves once the saved model and state are loaded from the store on startup. Calls made before `ready` resolves always go to your API, so you do not need to `await` it before using `decide`.
+</ResponseField>
+
+<ResponseField name="close()" type="() => Promise<void>">
+  Stops any in-progress compile (via `AbortSignal`) and closes the store. After `close()`, no further calls should be made on the `Decide` instance. When using JavaScript resource management, `decide[Symbol.asyncDispose]` is the same function.
+</ResponseField>
+
+<ResponseField name="stats()" type="() => Stats">
+  Returns a snapshot of current counters and live agreement. See the `Stats` shape below.
+</ResponseField>
+
+<ResponseField name="mode" type="'learning' | 'local' | 'guarded'">
+  Read-only. The current operating mode. Changes only on lifecycle events (install, guard trip, post-incident compile).
+</ResponseField>
+
+<ResponseField name="model" type="Model | null">
+  Read-only. The currently installed `Model`, or `null` if none has been compiled yet. The model is replaced atomically when a new compile installs.
+</ResponseField>
+
+---
+
+## The `Detailed` interface
+
+<ResponseField name="value" type="R">
+  The answer — identical to what calling `decide(input)` would return.
+</ResponseField>
+
+<ResponseField name="source" type="'local' | 'api' | 'fallback'">
+  Who produced the answer. `local` — the model answered. `api` — your API answered. `fallback` — your API threw and `fallback: true` was set, so the model answered instead.
+</ResponseField>
+
+<ResponseField name="choice" type="string | null">
+  The label that was read from the response. `null` when TinyDecide could not read a label (triggers an `unreadable` event the first time this happens).
+</ResponseField>
+
+<ResponseField name="confidence" type="number | null">
+  The local model's temperature-scaled confidence (0–1). `null` when your API answered.
+</ResponseField>
+
+<ResponseField name="ms" type="number">
+  Wall-clock milliseconds from the start of the call to the return of the value.
+</ResponseField>
+
+---
+
+## The `Stats` interface
+
+<ResponseField name="name" type="string | null">
+  The decision name passed to `shadow()`, or `null` for anonymous decisions.
+</ResponseField>
+
+<ResponseField name="mode" type="'learning' | 'local' | 'guarded'">
+  Current operating mode.
+</ResponseField>
+
+<ResponseField name="calls" type="number">
+  Total calls made since the instance was created.
+</ResponseField>
+
+<ResponseField name="local" type="number">
+  Calls answered by the local model.
+</ResponseField>
+
+<ResponseField name="api" type="number">
+  Calls answered by your API (including deferred and guarded calls).
+</ResponseField>
+
+<ResponseField name="fallback" type="number">
+  Calls answered locally because your API threw and `fallback: true` was set.
+</ResponseField>
+
+<ResponseField name="audits" type="number">
+  Calls answered locally that were also re-asked of your API for the live agreement check.
+</ResponseField>
+
+<ResponseField name="auditDisagree" type="number">
+  Audit calls where the local model and your API disagreed.
+</ResponseField>
+
+<ResponseField name="compiles" type="number">
+  Number of compiles started since the instance was created.
+</ResponseField>
+
+<ResponseField name="errors" type="number">
+  Number of internal errors caught and routed around (never call failures).
+</ResponseField>
+
+<ResponseField name="logged" type="number">
+  Number of answers currently in the store.
+</ResponseField>
+
+<ResponseField name="share" type="number">
+  Fraction of total calls answered locally since the instance started (0–1).
+</ResponseField>
+
+<ResponseField name="apiCallsSaved" type="number">
+  `local − audits`: calls answered locally that did not touch your API at all.
+</ResponseField>
+
+<ResponseField name="live" type="{ sampled: number; agreement: number | null; ci: [number, number] | null }">
+  Live agreement on the audit sample. `agreement` is the fraction that agreed; `ci` is the 95% Wilson interval. Both are `null` until at least one audit has run.
+</ResponseField>
+
+<ResponseField name="deferred" type="{ checked: number; agreement: number | null; baseline: number | null }">
+  Agreement on deferred calls (calls your API answered anyway, checked against the model's guess). `baseline` is the calibration-time agreement for comparison.
+</ResponseField>
+
+<ResponseField name="model" type="{ labels: number; cutoff: number; expectedShare: number | null; created: string | null } | null">
+  A summary of the installed model, or `null` if none exists yet.
+</ResponseField>
+
+---
+
+## Input shapes
+
+The model reads the input feature set from:
+
+- **String**: the full string is tokenized directly.
+- **`{ a, b }` pair**: both sides are featurized with side-aware and overlap features.
+- **Object with a `state`, `text`, `input`, `content`, or `message` field**: the first matching string field is used.
+- **Any other object**: every field value is tokenized together.
+
+The whole input is stored in the answer log alongside the label.
+
+---
+
+## Response shapes
+
+TinyDecide reads the label from your API's response automatically for:
+
+- **String**: `'billing'` — the string itself is the label.
+- **Object with `choice`, `label`, `decision`, or `answer`**: the value under the first matching key. Optional `probs` (a `{ label: probability }` map or an array in `labels` order) is also read when present.
+
+For any other shape, supply a `choice` function. For custom local answer construction, supply a `respond` function.
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```js Basic wrapping
+import { shadow } from 'tinydecide';
+
+const classify = shadow('support', (text) => api.classify(text));
+
+// Identical to calling api.classify(text) — until the model takes over.
+const label = await classify('my card was charged twice');
+```
+
+```js With options
+import { shadow } from 'tinydecide';
+
+const classify = shadow('support', (text) => api.classify(text), {
+  target: 0.99,           // certify 99% agreement
+  audit: 0.05,            // re-check 5% of local answers live
+  group: (input) => input.conversationId, // keep conversations together
+  fallback: true,         // answer locally if the API throws
+  log: (line, event) => logger.info(line, { event }),
+});
+```
+
+```js Using detailed()
+import { shadow } from 'tinydecide';
+
+const classify = shadow('support', (text) => api.classify(text));
+
+const result = await classify.detailed('my card was charged twice');
+// {
+//   value: 'billing',
+//   source: 'local',       // 'local' | 'api' | 'fallback'
+//   choice: 'billing',
+//   confidence: 0.97,
+//   ms: 0.012
+// }
+```
+
+```js Using stats()
+import { shadow } from 'tinydecide';
+
+const classify = shadow('support', (text) => api.classify(text));
+
+// After some traffic:
+const s = classify.stats();
+console.log(`Mode: ${s.mode}`);
+console.log(`${(s.share * 100).toFixed(1)}% answered locally`);
+console.log(`API calls saved: ${s.apiCallsSaved}`);
+if (s.live.agreement !== null) {
+  console.log(`Live agreement: ${(s.live.agreement * 100).toFixed(1)}%`);
+}
+```
+
+```js Using Symbol.asyncDispose
+import { shadow } from 'tinydecide';
+
+async function run() {
+  await using classify = shadow('support', (text) => api.classify(text));
+
+  for (const text of inputs) {
+    await classify(text);
+  }
+  // classify.close() is called automatically here
+}
+```
+
+</CodeGroup>
+
+<Note>
+  If anything inside `shadow()` throws — the local model, a disk write, a `choice` or `respond` hook, a `group` function — the error is caught internally, logged as an `error` event, and the call falls through to your API. A call that would have succeeded without TinyDecide always succeeds with it.
+</Note>

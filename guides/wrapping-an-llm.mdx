@@ -1,0 +1,207 @@
+---
+title: "Wrap an LLM Classifier with TinyDecide"
+sidebarTitle: "Wrapping an LLM"
+description: "Learn how to wrap an OpenAI-compatible LLM endpoint with TinyDecide so it learns from labels and classifies locally in microseconds."
+---
+
+TinyDecide is designed with LLM classifiers as the primary use case: your prompt goes out, a label comes back, and TinyDecide learns to reproduce those labels locally without ever touching the LLM again for the calls it is confident about. This guide walks through the complete `examples/llm-classifier.js` example, explains every part, and shows how to adapt it to your own endpoint, response shape, and label set.
+
+## The complete example
+
+The file below works with any OpenAI-compatible endpoint — a hosted open-weights model on OpenRouter, a local [vLLM](https://docs.vllm.ai/) server, [Ollama](https://ollama.com/), or a commercial model. By default it targets Mistral Nemo on OpenRouter.
+
+```js examples/llm-classifier.js
+// Wrap an LLM classifier. Any OpenAI-compatible endpoint works: an open-weights model on a hosted
+// API, vLLM, Ollama, or a commercial model. TinyDecide learns from the labels it returns.
+//
+//   LLM_API_KEY=… node examples/llm-classifier.js "my card was charged twice" "the app crashes when i log in"
+//
+// Defaults to Mistral Nemo on OpenRouter. With Ollama: LLM_BASE_URL=http://localhost:11434/v1 LLM_MODEL=llama3.2
+
+import { shadow } from 'tinydecide';
+
+const LABELS = ['billing', 'login', 'bug', 'cancel', 'other'];
+const BASE_URL = process.env.LLM_BASE_URL ?? 'https://openrouter.ai/api/v1';
+const MODEL = process.env.LLM_MODEL ?? 'mistralai/mistral-nemo';
+
+/** Your existing call: one support message in, one label out. */
+async function classify(text) {
+  const res = await fetch(`${BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(process.env.LLM_API_KEY && { authorization: `Bearer ${process.env.LLM_API_KEY}` }),
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      temperature: 0,
+      max_tokens: 4,
+      messages: [
+        { role: 'system', content: `Label the customer's support message. Reply with one word: ${LABELS.join(', ')}.` },
+        { role: 'user', content: text },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`${MODEL} returned HTTP ${res.status}`);
+  const reply = (await res.json()).choices[0].message.content.trim().toLowerCase();
+  return LABELS.find((label) => reply.startsWith(label)) ?? 'other';
+}
+
+// Every call reaches the LLM until a local model certifies; then the calls it is sure
+// about are answered locally. Answers and the model live in .tinydecide/support-route/.
+const route = shadow('support-route', classify, { labels: LABELS });
+
+for (const text of process.argv.slice(2)) {
+  const { value, source, ms } = await route.detailed(text);
+  console.log(`${value.padEnd(8)} ${source.padEnd(6)} ${ms.toFixed(1).padStart(7)} ms   ${text}`);
+}
+await route.close();
+```
+
+## How each part works
+
+<Steps>
+  <Step title="The classify() function">
+    `classify` is a plain async function — your existing API call, unchanged. It receives one input (a string here), calls the LLM, and returns a label string like `'billing'`. TinyDecide never touches the internals of this function. The `LABELS.find(…) ?? 'other'` guard normalises LLM output that might include punctuation or extra words.
+  </Step>
+
+  <Step title="shadow()">
+    `shadow('support-route', classify, { labels: LABELS })` wraps `classify` and returns a drop-in replacement. The name `'support-route'` is used in log lines and as the folder name under `.tinydecide/`. Every call still goes to `classify` during the learning phase; once a local model is certified, confident calls are answered in about 10 µs.
+
+    The `labels` option fixes the label set and its order. In this example that is required because the LLM sometimes returns a label TinyDecide has not seen yet, and a known set lets the local model map indices to names correctly.
+  </Step>
+
+  <Step title="detailed()">
+    `route.detailed(text)` returns `{ value, source, choice, confidence, ms }`. The `source` field tells you who answered: `'local'`, `'api'`, or `'fallback'`. The loop uses this to print a formatted table with latency per call.
+
+    `route(text)` (calling the function directly) does the same thing but returns only `value`, like the original `classify`.
+  </Step>
+
+  <Step title="close()">
+    `await route.close()` stops the compile worker and flushes the file store. Call it before your process exits; without it, an in-progress compile is aborted cleanly but Node may stay alive waiting for the worker to exit.
+  </Step>
+</Steps>
+
+## Environment variables
+
+The example reads three environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_API_KEY` | _(none)_ | Bearer token sent as the `authorization` header. Omit for Ollama or unauthenticated endpoints. |
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | Base URL for the OpenAI-compatible chat completions endpoint. |
+| `LLM_MODEL` | `mistralai/mistral-nemo` | Model identifier passed in the request body. |
+
+**Using Ollama locally:**
+
+```bash
+LLM_BASE_URL=http://localhost:11434/v1 LLM_MODEL=llama3.2 \
+  node examples/llm-classifier.js "my card was charged twice"
+```
+
+No `LLM_API_KEY` is needed — the example omits the header when the variable is not set.
+
+## Response shapes
+
+TinyDecide's built-in `choice` extractor reads the label from these response shapes automatically:
+
+```js
+// A plain string — the most common pattern when your function returns a label directly
+'billing'
+
+// An object with a `label` key
+{ label: 'billing' }
+
+// An object with a `choice` key
+{ choice: 'billing' }
+
+// An object with a `decision` key
+{ decision: 'billing' }
+
+// An object with an `answer` key
+{ answer: 'billing' }
+```
+
+Local answers come back in the same shape: a string for a string, or an object with the label under the same key. Other fields your API returns are not reproduced — use the `respond` option if you need them.
+
+## Returning probabilities
+
+Probability information helps TinyDecide learn faster and calibrate confidence more accurately. Pass probabilities in the response as either a `Record<string, number>` map or an array in `labels` order:
+
+```js
+// As a label → probability map — TinyDecide reads this without any extra options
+{ choice: 'billing', probs: { billing: 0.91, login: 0.05, bug: 0.02, cancel: 0.01, other: 0.01 } }
+
+// As a probabilities array — requires the labels option so TinyDecide knows the order
+{ choice: 'billing', probs: [0.91, 0.05, 0.02, 0.01, 0.01] }
+```
+
+Both `probs` and `probabilities` are recognised as the key name.
+
+## The `labels` option
+
+Pass `labels` when you want to fix the label set in advance:
+
+```js
+const route = shadow('support-route', classify, {
+  labels: ['billing', 'login', 'bug', 'cancel', 'other'],
+});
+```
+
+You must pass `labels` when your API returns probabilities as an array (so TinyDecide knows which index maps to which label). It is also useful to fix the label order so that log output, reports, and the compiled model all name labels consistently — even before TinyDecide has seen every label in traffic.
+
+## The `choice` option
+
+If your API returns an unusual response shape, pass a `choice` extractor:
+
+```js
+const route = shadow('support-route', api, {
+  // response is whatever your API returns; labels is the labels array you passed (or undefined)
+  choice(response, labels) {
+    // Return the label string directly
+    return response.data.classification.category;
+
+    // Or return { choice, probs } to include probabilities
+    // return { choice: response.data.classification.category, probs: response.data.scores };
+  },
+});
+```
+
+The function receives the raw response and your `labels` array. It should return a label string, or an object with `{ choice, probs }`. Return `null` if the response is unreadable — TinyDecide will log one warning and keep calling your API.
+
+## The `respond` option
+
+By default, local answers mirror the shape of your API's first readable response. Use `respond` to build the local answer yourself:
+
+```js
+const route = shadow('support-route', api, {
+  respond(decision, shape) {
+    // decision: { choice, index, confidence, margin, local, probs? }
+    // shape:    how your API's responses look (ResponseShape | null)
+    return {
+      category: decision.choice,
+      score: decision.confidence,
+      source: 'local',
+    };
+  },
+});
+```
+
+`respond` gives you full control. You can add fields, rename keys, or return a completely different shape. The `shape` argument describes what your API's responses look like, so you can replicate them if needed.
+
+<Tip>
+  Use `route.detailed(text)` instead of `route(text)` during development to check the `source` field on every response. When `source` is `'local'`, the answer came from TinyDecide's model, not the LLM. When it is `'api'`, the call still reached your LLM. You can also call `route.stats()` at any time to see the current mode, how many calls have been answered locally, and the live agreement estimate.
+</Tip>
+
+<Note>
+  Pass `fallback: true` to have TinyDecide answer locally when your LLM API throws an error and a model already exists:
+
+  ```js
+  const route = shadow('support-route', classify, {
+    labels: LABELS,
+    fallback: true,
+  });
+  ```
+
+  With `fallback: true`, the `source` field in a `detailed()` result can be `'fallback'` — meaning the LLM threw and the local model stepped in. This is useful for resilience during outages, but be aware that the fallback answers are not re-checked against your API, so they do not drive the live agreement monitor.
+</Note>

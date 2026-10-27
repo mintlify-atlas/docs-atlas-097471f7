@@ -1,0 +1,73 @@
+---
+title: "TinyDecide: Wrap Your Decision API, Answer Locally"
+sidebarTitle: "Introduction"
+description: "TinyDecide wraps any decision API, learns from its answers, and answers calls locally in microseconds with conformal-prediction certified agreement."
+---
+
+TinyDecide is an npm library for developers who call a decision API — an LLM classifier, a hosted ML model, a routing service — on every request. It wraps that function transparently, logs answers in the background, trains a tiny local model, certifies how far to trust it, and then starts answering the calls it is sure about in about 10 µs. Your API stays the reference: TinyDecide only takes over where agreement is certified, and switches back automatically when your API changes.
+
+## What TinyDecide Does
+
+Every call you make through `shadow()` follows a simple progression. On day one, your API answers every call exactly as before. TinyDecide logs each answer. Once 2,000 answers are collected, it trains a local model off the main thread, runs conformal-prediction certification to find the tightest margin cutoff that keeps agreement above your target, and installs the model. From that point on, calls whose top-two logit margin clears the cutoff are answered in microseconds. The rest still go to your API. A random audit sample is re-checked against your API continuously to catch drift.
+
+```js
+import { shadow } from 'tinydecide';
+
+const classify = shadow('support', (text) => api.classify(text));
+
+// Drop-in replacement: same input, same output shape, same error behavior
+await classify('my card was charged twice');
+```
+
+Nothing in your call site changes. The function you get back from `shadow()` is async, takes one input, and returns the same shape your API does — a string for a string, an object with the same keys for an object.
+
+## Lifecycle Modes
+
+A decision moves through three modes as it learns. Each transition is logged with a single line — never once per call.
+
+| Mode | Who answers | Until |
+|---|---|---|
+| **learning** | Your API, every call | 2,000 answers are logged and a compile certifies |
+| **local** | The model when its margin clears the certified cutoff; your API otherwise | A live check fails, or your API returns a label the model has never seen |
+| **guarded** | Your API, every call | A compile on answers given after the change certifies |
+
+<Note>
+  The thresholds above are defaults. The first compile triggers at `autoCompile.min` answers (default 2,000). Recompiles happen each time the answer count doubles, and at least every 20,000 answers.
+</Note>
+
+## Key Guarantees
+
+<Tip>
+  These guarantees hold without any configuration. You can tighten them with options like `target`, `delta`, and `compile: { guarantee: 'local' }`.
+</Tip>
+
+1. **Your API stays the reference.** Across all calls, the answers you get agree with your API at least 98% of the time, counting your API's own answers as agreeing. This is certified at 95% confidence on traffic like the traffic it learned from. You set the target. With `compile: { guarantee: 'local' }`, the local answers alone meet it too.
+
+2. **A call never fails because of TinyDecide.** If anything inside it throws — the model, the disk, your custom hooks — the call goes to your API.
+
+3. **API changes are caught.** A small random sample of local answers is re-checked against your API, and calls your API answers anyway are checked for free. When your API's answers move, every call goes back to it until a model trained on the new answers certifies. Replaying 221,636 real recorded calls produced no false alarms.
+
+4. **Restarts resume.** In Node, a named decision keeps its answers, model, and state in `.tinydecide/<name>/`. A crashed process picks up exactly where it left off.
+
+5. **Training runs off the main thread.** Compiles train in a worker thread. Two steps still pause the main thread briefly: reading the answer log at the start of each compile, and trimming the log once every 25,000 answers. On an M3 Pro, each takes about 45 ms with 100,000 short answers.
+
+6. **It says when it is not worth it.** Some decisions are beyond a word-level model. TinyDecide tells you and keeps calling your API rather than silently degrading.
+
+## What TinyDecide Is NOT
+
+Understanding the boundaries helps you decide where TinyDecide fits.
+
+- **Not a general-purpose language model.** The local model is a fastText-style linear classifier. It works on word and character patterns. Decisions that turn on meaning across a sentence pair, world knowledge, or reasoning mostly stay with your API — and TinyDecide tells you that in the compile verdict.
+
+- **Not a multi-label or free-text system.** TinyDecide handles single-label classification only. Multi-label outputs and free-text generation are out of scope.
+
+- **Not a replacement for decisions that require world knowledge.** If your API's answers depend on facts that shift over time — current prices, recent events, entity lookups — a word-level model cannot reproduce them. Expect a `not-worth-it` or `marginal` verdict, and keep calling your API.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Install TinyDecide and wrap your first API in under 5 minutes.
+  </Card>
+  <Card title="How It Works" icon="gear" href="/how-it-works">
+    The full pipeline: feature extraction, training, certification, and drift detection.
+  </Card>
+</CardGroup>

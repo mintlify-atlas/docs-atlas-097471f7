@@ -1,0 +1,200 @@
+---
+title: "Model Class — Inference, Serialization, and Introspection"
+sidebarTitle: "Model"
+description: "The compiled local classifier. Runs decide(), serializes to .tdm with toBytes()/fromBytes(), exposes logits(), and supports withCutoff()."
+---
+
+`Model` is the compiled local classifier produced by `compile()`. You can use it directly for offline inference, inspect its certificate and expected performance, serialize it to a `.tdm` file for deployment, or pass it to `shadow()` to start a session with a pre-built model rather than waiting for the first automatic compile. In browsers and edge runtimes, load a model with `Model.fromBytes()` from a `fetch` response.
+
+## Properties
+
+<ResponseField name="labels" type="string[]">
+  The label set in the order the model uses internally. Index 0 is the first label; `decide()` returns the label string, not the index, but `Decision.index` gives the position in this array.
+</ResponseField>
+
+<ResponseField name="cutoff" type="number">
+  The certified margin threshold. `decide()` sets `Decision.local = true` when the gap between the top two logits is at least this value. `Infinity` when nothing has been certified (the model exists but no cutoff was found that met the target).
+</ResponseField>
+
+<ResponseField name="T" type="number">
+  Temperature for confidence calibration. Applied only to the reported `confidence` value via softmax; does not affect the cutoff decision or logit ordering.
+</ResponseField>
+
+<ResponseField name="meta" type="ModelMeta">
+  Metadata attached at compile time. Contains:
+
+  <Expandable title="ModelMeta fields">
+    <ResponseField name="meta.certificate" type="Certificate | undefined">
+      The formal conformal certificate: `target`, `delta`, `guarantee`, `n`, `local`, `errors`, `pValue`, `cutoff`. See [Certification](/guarantee/certification).
+    </ResponseField>
+    <ResponseField name="meta.rows" type="{ total: number; train: number; calib: number; test: number } | undefined">
+      Record counts from the compile that produced this model.
+    </ResponseField>
+    <ResponseField name="meta.expected" type="object | undefined">
+      Expected runtime performance based on calibration: `share` (fraction answered locally), `localAgreement`, and `deferred` (agreement on deferred calls, used by `shadow()` for the live deferred check).
+    </ResponseField>
+    <ResponseField name="meta.verdict" type="Verdict | undefined">
+      The compile verdict: `'ship'`, `'marginal'`, `'not-worth-it'`, or `'need-more-data'`.
+    </ResponseField>
+    <ResponseField name="meta.response" type="ResponseShape | null | undefined">
+      The response shape learned from your API, stored so `shadow()` can build local answers in the same format after a restart.
+    </ResponseField>
+    <ResponseField name="meta.created" type="string | undefined">
+      ISO 8601 timestamp of when the model was compiled.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="bytes" type="number">
+  Size of the weight arrays in bytes (keys + scales + embeddings + head weights + bias). Does not include the JSON header; use `toBytes().byteLength` for the full `.tdm` file size.
+</ResponseField>
+
+---
+
+## Methods
+
+<ResponseField name="decide(input, options?)" type="(input: unknown, options?: { probs?: boolean }) => Decision">
+  Runs inference on `input` and returns a `Decision`. Pass `{ probs: true }` to include a per-label probability map in the result.
+
+  The `Decision` interface:
+
+  <Expandable title="Decision fields">
+    <ResponseField name="choice" type="string">
+      The predicted label string.
+    </ResponseField>
+    <ResponseField name="index" type="number">
+      The index of the predicted label in `model.labels`.
+    </ResponseField>
+    <ResponseField name="confidence" type="number">
+      Temperature-scaled probability of the top label (0–1). Calibrated to match how often your API agrees with the model's guess on held-out data.
+    </ResponseField>
+    <ResponseField name="margin" type="number">
+      Gap between the top two raw logits. This is the value compared against `model.cutoff`. `Infinity` for single-label models.
+    </ResponseField>
+    <ResponseField name="local" type="boolean">
+      `true` when `margin >= model.cutoff` — i.e., `shadow()` would answer this call locally. `false` when the model is not confident enough or has not been certified.
+    </ResponseField>
+    <ResponseField name="probs" type="Record<string, number> | undefined">
+      Per-label probabilities, present only when `{ probs: true }` was passed. Keys are label strings; values sum to 1.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="logits(input)" type="(input: unknown) => Float32Array">
+  Returns the raw (pre-softmax) logit vector for `input`. One float per label, in `model.labels` order. **The returned array is reused on every call** — copy it (`Float32Array.from(model.logits(input))`) before storing or comparing across calls.
+</ResponseField>
+
+<ResponseField name="withCutoff(cutoff)" type="(cutoff: number) => Model">
+  Returns a new `Model` instance that is identical to this one but uses a different `cutoff`. Use `Infinity` to disable local answering entirely (useful for benchmarking the model's raw accuracy), or a lower value to answer more calls at the cost of a lower agreement guarantee. The certificate in `meta` still reflects the original certified cutoff.
+</ResponseField>
+
+<ResponseField name="toBytes()" type="() => Uint8Array">
+  Serializes the model to the `.tdm` binary format. The format is: four magic bytes (`TDM1`), a little-endian `uint32` header length, a UTF-8 JSON header (padded to a 4-byte boundary), then the weight arrays in order: keys (`Uint32Array`), scales (`Float32Array`), head weights (`Float32Array`), bias (`Float32Array`), embeddings (`Int8Array`).
+</ResponseField>
+
+<ResponseField name="Model.fromBytes(bytes)" type="(bytes: Uint8Array | ArrayBuffer) => Model">
+  Deserializes a `.tdm` file. Accepts a `Uint8Array` or `ArrayBuffer` (e.g. from `fetch().arrayBuffer()`). Throws if the magic bytes do not match, or if the model was built with an incompatible featurizer version.
+</ResponseField>
+
+---
+
+## Node-only helpers
+
+These functions are exported from `tinydecide` when running in Node. They are not available in browser or edge bundles.
+
+<ResponseField name="loadModel(path)" type="(path: string) => Model">
+  Reads a `.tdm` file from disk and deserializes it. Equivalent to `Model.fromBytes(readFileSync(path))`.
+</ResponseField>
+
+<ResponseField name="saveModel(path, model)" type="(path: string, model: Model) => void">
+  Serializes the model and writes it to `path` atomically (write to a temp file, then rename). Creates parent directories as needed. Safe to call while another process reads the file.
+</ResponseField>
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```js Loading from a file (Node)
+import { loadModel } from 'tinydecide';
+
+const model = loadModel('.tinydecide/support/model.tdm');
+
+console.log(`Labels: ${model.labels.join(', ')}`);
+console.log(`Cutoff: ${model.cutoff}`);
+console.log(`Compiled: ${model.meta.created}`);
+```
+
+```js Loading from a fetch response (browser)
+import { Model } from 'tinydecide';
+
+const response = await fetch('/models/support.tdm');
+const buffer = await response.arrayBuffer();
+const model = Model.fromBytes(buffer);
+
+console.log(`${model.labels.length} labels, ${model.bytes} bytes`);
+```
+
+```js Running inference directly
+import { loadModel } from 'tinydecide';
+
+const model = loadModel('./support.tdm');
+
+const decision = model.decide('my card was charged twice', { probs: true });
+// {
+//   choice: 'billing',
+//   index: 2,
+//   confidence: 0.94,
+//   margin: 3.71,
+//   local: true,         // margin >= model.cutoff
+//   probs: { billing: 0.94, auth: 0.04, shipping: 0.02 }
+// }
+
+console.log(`Would answer locally: ${decision.local}`);
+```
+
+```js Inspecting the certificate
+import { loadModel } from 'tinydecide';
+
+const model = loadModel('./support.tdm');
+const cert = model.meta.certificate;
+
+if (cert) {
+  console.log(`Certified target: ${(cert.target * 100).toFixed(0)}%`);
+  console.log(`Confidence: ${((1 - cert.delta) * 100).toFixed(0)}%`);
+  console.log(`Cutoff: ${cert.cutoff.toFixed(3)}`);
+  console.log(`Calibration rows: ${cert.n}`);
+  console.log(`Local errors: ${cert.errors} / ${cert.local}`);
+}
+```
+
+```js Serializing and deserializing
+import { Model } from 'tinydecide';
+import { writeFileSync, readFileSync } from 'node:fs';
+
+// Serialize
+const bytes = model.toBytes();
+writeFileSync('./support.tdm', bytes);
+
+// Deserialize
+const loaded = Model.fromBytes(readFileSync('./support.tdm'));
+console.log(loaded.labels); // same labels, same cutoff
+```
+
+```js Passing to shadow() as a starting model
+import { shadow, loadModel } from 'tinydecide';
+
+// Load a model compiled offline (e.g. by npx tinydecide compile)
+const model = loadModel('./support.tdm');
+
+const classify = shadow('support', (text) => api.classify(text), {
+  model,            // start in 'local' mode immediately
+  autoCompile: false, // skip automatic recompiles; manage them yourself
+});
+
+// classify is already in 'local' mode — no warm-up period needed.
+const label = await classify('reset my password');
+```
+
+</CodeGroup>

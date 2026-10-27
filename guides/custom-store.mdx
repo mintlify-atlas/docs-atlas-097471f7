@@ -1,0 +1,213 @@
+---
+title: "Use a Custom Store with TinyDecide"
+sidebarTitle: "Custom Store"
+description: "Implement a custom Store to keep TinyDecide's answers, model, and guard state in a database, S3 bucket, Redis, or any other backend."
+---
+
+A store is where TinyDecide keeps the three things it needs to survive a restart: the answer log, the compiled model, and the guard state. By default it uses a file store under `.tinydecide/<name>/` in Node and a memory store everywhere else. Supplying your own store lets you put those things anywhere — a Postgres table, an S3 bucket, a Redis stream, or a shared API endpoint — without changing anything else about how TinyDecide works.
+
+## The Store interface
+
+A store only needs two methods. Everything else is optional:
+
+```ts
+interface Store {
+  /** Append one answer record. May be async. */
+  append(record: AnswerRecord): void | Promise<void>;
+
+  /** Return all recent answers, oldest first. May be async. */
+  load(): AnswerRecord[] | Promise<AnswerRecord[]>;
+
+  /** Optional: current number of stored records. Used to schedule compiles. */
+  readonly size?: number;
+
+  /** Optional: load the last saved model. Without this, a restart starts from scratch. */
+  loadModel?(): Model | null | Promise<Model | null>;
+
+  /** Optional: save a newly compiled model. */
+  saveModel?(model: Model, report: Report): void | Promise<void>;
+
+  /** Optional: load the guard state. Without this, a restart loses the guarded mode. */
+  loadState?(): StoreState | null | Promise<StoreState | null>;
+
+  /** Optional: save or clear the guard state. Called with null to clear it. */
+  saveState?(state: StoreState | null): void | Promise<void>;
+
+  /** Optional: clean up when decide.close() is called. */
+  close?(): void | Promise<void>;
+}
+```
+
+Any method may return a Promise. TinyDecide awaits them where needed without blocking the main thread unnecessarily.
+
+## The AnswerRecord shape
+
+Each answer is recorded as:
+
+```ts
+interface AnswerRecord {
+  /** Unix timestamp (ms). */
+  t: number;
+  /** The original input, exactly as passed to shadow(). */
+  input: unknown;
+  /** The label your API returned. */
+  choice: string;
+  /** Optional probability map (label → probability). */
+  probs?: Record<string, number>;
+  /** Optional group identifier, from the group() option. */
+  group?: string;
+  /**
+   * false when the call was logged only because the model deferred it.
+   * These records are used for training but never for certifying.
+   */
+  sample?: false;
+}
+```
+
+## Built-in stores
+
+TinyDecide ships two stores:
+
+| Store | Description |
+|---|---|
+| `memoryStore()` | Keeps everything in memory. The default in browsers, workers, and edge runtimes. |
+| `fileStore(dir)` | Keeps answers, model, state, and a lock in a folder. The default for named decisions in Node. |
+
+```js
+import { memoryStore } from 'tinydecide';
+import { fileStore } from 'tinydecide'; // Node only
+```
+
+`fileStore` accepts an optional `{ limit }` option (default 100,000) that caps how many answer rows it stores.
+
+## Example: a minimal in-memory store
+
+The simplest custom store only needs `append` and `load`. This is useful for testing or for environments where you manage persistence separately:
+
+```js
+function myStore() {
+  const rows = [];
+  return {
+    append(record) {
+      rows.push(record);
+    },
+    load() {
+      return rows.slice(); // return a copy
+    },
+    get size() {
+      return rows.length;
+    },
+  };
+}
+
+const classify = shadow('support', api, { store: myStore() });
+```
+
+## Example: a store that sends answers to a shared endpoint
+
+In multi-instance or serverless deployments, each instance can forward its answers to a shared backend so all instances benefit from each other's traffic:
+
+```js
+function sharedStore(backendUrl) {
+  // A local buffer so we never await network I/O on the hot path
+  const buffer = [];
+  let flushing = false;
+
+  async function flush() {
+    if (flushing || buffer.length === 0) return;
+    flushing = true;
+    const batch = buffer.splice(0, buffer.length);
+    try {
+      await fetch(`${backendUrl}/answers`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(batch),
+      });
+    } catch {
+      // On failure, put the batch back so it is retried on the next append.
+      buffer.unshift(...batch);
+    } finally {
+      flushing = false;
+    }
+  }
+
+  return {
+    append(record) {
+      buffer.push(record);
+      // Fire-and-forget: TinyDecide does not await append() unless it returns a Promise.
+      flush();
+    },
+    async load() {
+      const res = await fetch(`${backendUrl}/answers`);
+      return res.json(); // expects AnswerRecord[]
+    },
+    async loadModel() {
+      const res = await fetch(`${backendUrl}/model.tdm`);
+      if (!res.ok) return null;
+      const { Model } = await import('tinydecide');
+      return Model.fromBytes(await res.arrayBuffer());
+    },
+    async saveModel(model) {
+      await fetch(`${backendUrl}/model.tdm`, {
+        method: 'PUT',
+        body: model.toBytes(),
+      });
+    },
+  };
+}
+
+const classify = shadow('support', api, {
+  store: sharedStore('https://internal.example.com/tinydecide'),
+});
+```
+
+## Passing the store to shadow()
+
+Pass any store object via the `store` option:
+
+```js
+const classify = shadow('support', api, { store: myStore });
+```
+
+<Note>
+  When you pass a `store`, the `dir` option is ignored. TinyDecide does not create a `.tinydecide/` folder or write any files to disk.
+</Note>
+
+## Compiling from a shared store
+
+Once you have accumulated enough answers in your shared backend, compile a model with the CLI:
+
+```bash
+npx tinydecide compile answers.jsonl --out support.tdm
+```
+
+Then load the compiled model and pass it to `shadow` with `autoCompile: false` to prevent each instance from compiling independently:
+
+```js
+import { loadModel, shadow } from 'tinydecide';
+
+const model = loadModel('support.tdm');
+
+const classify = shadow('support', api, {
+  model,
+  autoCompile: false,
+  store: sharedStore('https://internal.example.com/tinydecide'),
+});
+```
+
+The live agreement checks still run on every instance. If the model drifts from your API's answers, every instance falls back to the API on its own, and you can recompile once the drift is resolved.
+
+<Tip>
+  Use `memoryStore({ records: previousAnswers })` to seed a new store instance with answers you already have — for example, answers loaded from a database at startup before the store is connected:
+
+  ```js
+  import { memoryStore } from 'tinydecide';
+
+  const previousAnswers = await db.query('SELECT * FROM answers ORDER BY t ASC');
+  const store = memoryStore({ records: previousAnswers });
+
+  const classify = shadow('support', api, { store });
+  ```
+
+  This is also useful in tests: seed the store with recorded answers and skip the learning phase entirely.
+</Tip>

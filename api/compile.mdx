@@ -1,0 +1,261 @@
+---
+title: "compile() — Train and Certify a Local Model"
+sidebarTitle: "compile()"
+description: "Train a fastText-style classifier on logged answers and certify a margin cutoff with conformal prediction. Returns model and report."
+---
+
+`compile()` trains a local model on your API's logged answers and certifies a margin cutoff using conformal prediction (Learn-Then-Test). It splits records into train, calibration, and test sets by group — so repeats never leak across the split — trains a fastText-style model, quantizes the weights to int8, and then picks the loosest cutoff for which agreement with your API on calibration traffic meets your `target` with probability at least `1 − delta`. Every number in the report is measured on the int8 model that ships.
+
+`shadow()` calls `compile()` automatically on a schedule (in a worker thread in Node). The standalone export is available for offline use: building models from JSONL logs, CI pipelines, or batch retraining jobs.
+
+## Function signature
+
+```ts
+compile(
+  records: Iterable<TrafficRecord>,
+  options?: Partial<CompileOptions>
+): Promise<{ model: Model; report: Report }>
+```
+
+## Parameters
+
+<ParamField path="records" type="Iterable<TrafficRecord>" required>
+  An array or any iterable of answer records. Each record must supply the input and a label. The accepted field names are:
+
+  - **Input**: `input` (any value); or `a` + `b` (string pair); or a string `text`, `state`, `content`, or `message` field.
+  - **Label**: `choice`, `label`, `decision`, or `answer`. A numeric value is treated as an index into `labels`.
+  - **Probabilities** (optional): `probs` — a `{ label: probability }` map, or an array in `labels` order.
+  - **Group** (optional): `group` — a string that keeps related records in the same split.
+
+  Records where the input and label cannot be resolved are counted in `report.rows.skipped`.
+</ParamField>
+
+<ParamField path="options" type="Partial<CompileOptions>" optional>
+  All fields are optional; defaults are applied for any field not supplied. See `CompileOptions` below.
+</ParamField>
+
+### CompileOptions
+
+<ParamField path="target" type="number" default="0.98">
+  Agreement with your API to certify. Must be between 0 and 1 (exclusive). The compile certifies that, with probability at least `1 − delta` over the calibration draw, agreement on future traffic at least this high.
+</ParamField>
+
+<ParamField path="delta" type="number" default="0.05">
+  One minus the confidence of the certificate. At `0.05`, the bound holds with 95% probability.
+</ParamField>
+
+<ParamField path="guarantee" type="'overall' | 'local'" default="'overall'">
+  What the certificate covers. `overall`: agreement across all calls, where your API's own answers count as agreeing (so deferred calls never hurt the guarantee). `local`: agreement on the local answers alone. `local` covers a stronger claim but answers a smaller share of calls.
+</ParamField>
+
+<ParamField path="labels" type="string[]" optional>
+  Fixes the label set and its order. When omitted, labels are inferred from the records (sorted alphabetically, or from a `labels` header row if present). Required when `probs` values are arrays.
+</ParamField>
+
+<ParamField path="calib" type="number" default="0.25">
+  Share of records held out for calibration (certifying the cutoff). Must be between 0 and 1.
+</ParamField>
+
+<ParamField path="test" type="number" default="0.1">
+  Share of records held out to report on (the held-out check in the report). Must be between 0 and 1.
+</ParamField>
+
+<ParamField path="seed" type="number" default="1">
+  Seed for the train/calib/test split. Change to get a different draw; the split is deterministic for any given seed and record set.
+</ParamField>
+
+<ParamField path="audit" type="number" default="0.02">
+  The audit rate the compiled model will run with, used to estimate `savings.apiCallsAvoided` in the report.
+</ParamField>
+
+<ParamField path="d" type="number" default="32">
+  Width of each feature embedding vector. Larger values may improve accuracy on many-label problems at the cost of a bigger model.
+</ParamField>
+
+<ParamField path="maxFeatures" type="number" default="200000">
+  Maximum number of features the model keeps, the most frequent first. Reducing this shrinks the model file but may reduce accuracy.
+</ParamField>
+
+<ParamField path="onProgress" type="(progress: { phase: string; done: number }) => void" optional>
+  Called at each training phase (`'features'`, training epochs, `'done'`). `done` is a 0–1 fraction. Use this to drive a progress bar or log compile progress.
+</ParamField>
+
+<ParamField path="signal" type="AbortSignal" optional>
+  An `AbortSignal` to cancel the compile. When aborted, `compile()` throws an `AbortError`. Inside `shadow()`, the guard tripping during a compile uses this mechanism to stop the in-flight compile.
+</ParamField>
+
+---
+
+## Return value
+
+`compile()` resolves to `{ model, report }`.
+
+- `model` is a `Model` instance ready for inference. See [Model](/api/model).
+- `report` is documented below.
+
+### Report fields
+
+<ResponseField name="verdict" type="'ship' | 'marginal' | 'not-worth-it' | 'need-more-data'">
+  A summary judgment. `ship` — at least 25% of calls are answered locally. `marginal` — 5–25%. `not-worth-it` — below 5%; the decision is beyond a word-level model. `need-more-data` — not enough calibration rows to certify anything yet.
+</ResponseField>
+
+<ResponseField name="summary" type="string">
+  One plain-English sentence summarizing the verdict, the certified share, the target, and — when the share is low — a suggestion (e.g. a looser target that would answer more calls).
+</ResponseField>
+
+<ResponseField name="labels" type="string[]">
+  The full label set in the order the model uses.
+</ResponseField>
+
+<ResponseField name="target" type="number">
+  The `target` value used for this compile.
+</ResponseField>
+
+<ResponseField name="delta" type="number">
+  The `delta` value used for this compile.
+</ResponseField>
+
+<ResponseField name="guarantee" type="'overall' | 'local'">
+  The guarantee type used for this compile.
+</ResponseField>
+
+<ResponseField name="rows" type="{ total: number; train: number; calib: number; test: number; skipped: number }">
+  Record counts. `total` is all valid records; `skipped` is records where no input or label could be resolved.
+</ResponseField>
+
+<ResponseField name="features" type="number">
+  Number of features in the trained model.
+</ResponseField>
+
+<ResponseField name="epochs" type="number">
+  Number of training epochs completed.
+</ResponseField>
+
+<ResponseField name="certificate" type="Certificate">
+  The formal conformal certificate. See [Certification](/guarantee/certification). Fields: `target`, `delta`, `guarantee`, `n` (calibration rows), `local` (rows answered locally), `errors` (local answers that disagreed), `pValue`, `cutoff` (the certified margin threshold; `Infinity` when nothing certified).
+</ResponseField>
+
+<ResponseField name="calib" type="{ share: number; localAgreement: number | null; overallAgreement: number | null; rawAgreement: number | null }">
+  What the certified cutoff did on the calibration set. `share` — fraction of calls answered locally. `localAgreement` — agreement on those local answers. `overallAgreement` — agreement across all calibration calls. `rawAgreement` — agreement of the top prediction before the cutoff is applied.
+</ResponseField>
+
+<ResponseField name="test" type="object | null">
+  What the certified cutoff did on the held-out test set, with 95% Wilson confidence intervals. `null` when no test rows were available. Fields: `n`, `share`, `overallAgreement`, `overallCI`, `localAgreement`, `localCI`, `rawAgreement`, `int8Flips` (rows where the int8 model picks a different top label than the float model).
+</ResponseField>
+
+<ResponseField name="whatIf" type="{ target: number; share: number }[]">
+  Share answered locally at other agreement targets (`0.90`, `0.95`, `0.97`, `0.98`, `0.99`, `0.995`). Useful for picking a target that balances savings against the guarantee.
+</ResponseField>
+
+<ResponseField name="savings" type="{ apiCallsAvoided: number; auditRate: number }">
+  Estimated API calls avoided per call at the `audit` rate used. `apiCallsAvoided` = `calib.share × (1 − audit)`.
+</ResponseField>
+
+<ResponseField name="temperature" type="number">
+  The fitted temperature used to calibrate reported confidence scores. Does not affect the cutoff.
+</ResponseField>
+
+<ResponseField name="bytes" type="number">
+  Size of the serialized `.tdm` model file in bytes.
+</ResponseField>
+
+<ResponseField name="latencyUs" type="number">
+  Median inference latency in microseconds, measured on the int8 model.
+</ResponseField>
+
+<ResponseField name="ms" type="{ train: number; total: number }">
+  Wall-clock compile time in milliseconds. `train` covers the training phase; `total` covers the full compile including featurization, calibration, and test evaluation.
+</ResponseField>
+
+---
+
+## TrafficRecord format
+
+`compile()` accepts any iterable of plain objects. The field names it recognizes:
+
+| Purpose | Accepted field names |
+|---|---|
+| Input | `input` (any type); or `a` + `b` (string pair); or `text`, `state`, `content`, `message` (first string field found) |
+| Label | `choice`, `label`, `decision`, `answer` (first defined field); or a numeric index when `labels` is provided |
+| Probabilities | `probs` — `{ label: number }` map or number array in `labels` order |
+| Group | `group` — string; records with the same group go into the same split |
+
+Records that come from `shadow()` automatically include `t` (timestamp), `input`, `choice`, `probs` (when available), `group` (when configured), and `sample: false` for deferred calls. Deferred records (where `sample === false`) are used for training but never for calibration.
+
+---
+
+## Code examples
+
+<CodeGroup>
+
+```js Compiling from an array
+import { compile } from 'tinydecide';
+
+const records = [
+  { input: 'my card was charged twice', choice: 'billing' },
+  { input: 'reset my password', choice: 'auth' },
+  { input: 'track my order', choice: 'shipping' },
+  // ...at least 2,000 records recommended
+];
+
+const { model, report } = await compile(records, { target: 0.98 });
+
+console.log(report.summary);
+// "Answers 63.2% of calls locally while keeping overall agreement with your API ≥ 98% (95% confidence)."
+console.log(`Verdict: ${report.verdict}`);       // 'ship'
+console.log(`Cutoff: ${report.certificate.cutoff.toFixed(3)}`);
+```
+
+```js Compiling from a JSONL file (Node)
+import { readJsonl, compile, saveModel } from 'tinydecide';
+
+// answers.jsonl holds one JSON object per line:
+// {"input":"reset my password","choice":"auth","t":1700000000000}
+const records = readJsonl('./answers.jsonl');
+
+const { model, report } = await compile(records, {
+  target: 0.98,
+  delta: 0.05,
+  guarantee: 'overall',
+});
+
+if (report.verdict === 'ship' || report.verdict === 'marginal') {
+  await saveModel('./support.tdm', model);
+  console.log(`Saved ${report.bytes} byte model`);
+}
+```
+
+```js Using onProgress
+import { compile } from 'tinydecide';
+
+const { model, report } = await compile(records, {
+  onProgress({ phase, done }) {
+    process.stdout.write(`\r${phase}: ${(done * 100).toFixed(0)}%`);
+  },
+});
+```
+
+```js Using AbortSignal to cancel
+import { compile } from 'tinydecide';
+
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 30_000); // cancel after 30 s
+
+try {
+  const { model, report } = await compile(records, {
+    signal: controller.signal,
+  });
+} catch (err) {
+  if (err.name === 'AbortError') {
+    console.log('compile cancelled');
+  } else {
+    throw err;
+  }
+}
+```
+
+</CodeGroup>
+
+<Note>
+  Inside `shadow()`, compiles run in a worker thread by default (Node), so they do not block the event loop. The standalone `compile()` export runs synchronously in the calling thread. Two steps inside every compile briefly touch the main thread inside `shadow()`: reading the answer log at the start, and trimming the log once every 25,000 answers.
+</Note>

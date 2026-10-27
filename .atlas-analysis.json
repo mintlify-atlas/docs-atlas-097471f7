@@ -1,0 +1,103 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "TinyDecide",
+  "projectDescription": "An npm library that wraps any decision API (LLM classifier, ML model, etc.) and transparently learns to answer locally in microseconds with statistically certified agreement guarantees.",
+  "theme": "luma",
+  "primaryColor": "#4F6CF7",
+  "lightColor": "#EEF1FE",
+  "darkColor": "#1B2370",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/wrapping-an-llm",
+              "guides/deployment",
+              "guides/custom-store",
+              "guides/browsers-and-edge"
+            ]
+          },
+          {
+            "group": "The Guarantee",
+            "pages": [
+              "guarantee/certification",
+              "guarantee/drift-detection",
+              "guarantee/benchmark-results"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/shadow",
+              "api/compile",
+              "api/model",
+              "api/stores"
+            ]
+          },
+          {
+            "group": "CLI",
+            "pages": [
+              "api/cli"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "api/types",
+              "api/options"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Zero-dependency drop-in wrapper for any decision API (LLM, classifier, etc.)",
+    "Automatic local model training from logged API answers with no configuration",
+    "Conformal prediction certificate: ≥98% agreement with your API at 95% confidence",
+    "Microsecond local inference (~8–30 µs) vs. hundreds of milliseconds from a remote API",
+    "Drift detection via CUSUM and per-label deferred checks — guard trips and reverts automatically",
+    "Runs in Node.js, Bun, browsers, Web Workers, and edge runtimes; 12 KB gzipped",
+    "Worker-thread compilation off the main thread",
+    "Persistent state across restarts: answers, model, and guard state stored in .tinydecide/"
+  ],
+  "publicApiSurface": [
+    "shadow(name, api, options) → Decide",
+    "compile(records, options) → Promise<{ model, report }>",
+    "Model.fromBytes(bytes) / model.toBytes()",
+    "model.decide(input, options) → Decision",
+    "memoryStore(options) → Store",
+    "fileStore(dir, options) → Store (Node only)",
+    "loadModel(path) → Model (Node only)",
+    "saveModel(path, model) (Node only)",
+    "readJsonl(path, options) → Record[] (Node only)",
+    "decide.detailed(input) → Promise<Detailed>",
+    "decide.stats() → Stats",
+    "decide.compile() → Promise<Report | null>",
+    "decide.close() → Promise<void>",
+    "decide.ready → Promise<void>",
+    "decide.mode → Mode",
+    "decide.model → Model | null",
+    "tinydecide try",
+    "tinydecide status [dir]",
+    "tinydecide compile <answers> [--out] [--target] [--delta] [--guarantee] [--labels] [--audit]",
+    "tinydecide inspect <model.tdm>",
+    "tinydecide decide <model.tdm> [text...]"
+  ]
+}

@@ -1,0 +1,180 @@
+---
+title: "How TinyDecide Certifies Agreement with Your API"
+sidebarTitle: "Certification"
+description: "How TinyDecide uses conformal prediction to certify that a local model agrees with your API at a guaranteed rate, and how to configure it."
+---
+
+TinyDecide uses a technique called Learn-Then-Test — a form of conformal prediction — to certify that its local model's answers agree with your API at a statistically guaranteed rate. Before any local answer is ever shown to your users, a certificate is issued: with probability at least `1 − delta` over the sample it learned from, agreement between the local model and your API on traffic like that sample will be at least `target`. No model ships without a certificate. If the math doesn't close, TinyDecide tells you, keeps calling your API, and tries again when more data arrives.
+
+## What "agreement" means
+
+There are two modes for what the certificate covers, controlled by the `guarantee` option.
+
+**Overall (default).** The certificate covers agreement across all calls — local and non-local together. Your API's own answers count as agreeing (they always match your API), so the rate of answers the user sees that disagree with your API is bounded below `1 − target`. This is the right mode for most apps: you care about the total error rate to users.
+
+**Local.** The certificate covers only the calls the local model answers. With `compile: { guarantee: 'local' }`, agreement on those local answers alone is guaranteed to be at least `target`. This is stricter: it answers fewer calls locally, but every local answer is individually certified reliable.
+
+## The certification process
+
+<Steps>
+  <Step title="Split answers into train, calibration, and test">
+    Every logged answer is assigned to one of three splits by hashing its `group` (if you pass one) or its normalized input text. Repeats of the same input always land in the same split, so identical questions can never leak from training into calibration. The default split is 65% train, 25% calibration, 10% test.
+  </Step>
+  <Step title="Train and quantize the model to int8">
+    A fastText-style linear model is trained on the training split using your API's soft labels (probabilities if available, one-hot otherwise). The trained weights are immediately quantized to int8, with one scale per row. Every measurement from this point forward is made on the int8 model that will ship — not a float32 draft.
+  </Step>
+  <Step title="Run Learn-Then-Test over a fixed margin grid">
+    Learn-Then-Test (Angelopoulos et al., 2021) walks a grid of 601 candidate cutoffs on the logit margin — fixed before looking at calibration data, as the method requires — from the strictest to the loosest. For each cutoff, it runs a one-sided binomial test: does the observed error rate on calibration certify the risk bound at level `delta`? The walk stops at the first cutoff that fails.
+  </Step>
+  <Step title="Find the loosest certified cutoff">
+    The loosest cutoff for which the binomial test passes at level `delta` is the one that ships. "Loosest" means most calls are answered locally: the algorithm always maximizes coverage while staying within the guarantee. If no cutoff certifies (too few calibration rows, or the model is not accurate enough), the certificate has `cutoff: Infinity` and no calls are answered locally.
+  </Step>
+  <Step title="Measure everything on the shipped model">
+    The test split is used to produce the held-out numbers in the report — agreement, Wilson confidence intervals, local share — but these are descriptive only. The guarantee is on the calibration split. Every number you see in a report, including latency, is measured on the int8 model that actually ships.
+  </Step>
+</Steps>
+
+## The Certificate fields
+
+The `Certificate` object is embedded in every compile report and stored in the model file:
+
+```typescript
+export interface Certificate {
+  target: number;
+  delta: number;
+  guarantee: 'overall' | 'local';
+  /** Calibration rows. */
+  n: number;
+  local: number;
+  errors: number;
+  pValue: number;
+  /** Answer locally when the top-two logit margin is at least this. Infinity when nothing certified. */
+  cutoff: number;
+}
+```
+
+| Field | What it means |
+|---|---|
+| `target` | The minimum agreement level the certificate covers |
+| `delta` | The confidence budget: the certificate holds with probability at least `1 − delta` |
+| `guarantee` | `'overall'` or `'local'` — which calls the certificate covers |
+| `n` | Number of calibration rows used to issue the certificate |
+| `local` | How many calibration rows cleared the cutoff (were answered locally) |
+| `errors` | Of those `local` rows, how many disagreed with your API |
+| `pValue` | The binomial p-value at the certified cutoff; always ≤ `delta` |
+| `cutoff` | The logit-margin threshold — answer locally when `margin ≥ cutoff`; `Infinity` means nothing certified |
+
+## Configuring the certificate
+
+The three certificate parameters — `target`, `delta`, and `guarantee` — can be set either on `shadow()` or passed to `compile()` directly:
+
+<CodeGroup>
+```js shadow()
+import { shadow } from 'tinydecide';
+
+const classify = shadow('support', api, {
+  target: 0.98,                  // certify ≥ 98% agreement (default)
+  delta: 0.05,                   // at 95% confidence (default)
+  compile: {
+    guarantee: 'overall',        // cover all calls, not just local ones (default)
+  },
+});
+```
+
+```js compile()
+import { compile } from 'tinydecide';
+
+const { model, report } = await compile(records, {
+  target: 0.98,
+  delta: 0.05,
+  guarantee: 'local',            // certify local answers alone
+});
+```
+</CodeGroup>
+
+| Option | Default | Notes |
+|---|---|---|
+| `target` | `0.98` | Agreement to certify. Must be between 0 and 1. |
+| `delta` | `0.05` | One minus confidence. `0.05` means 95% confidence. |
+| `guarantee` | `'overall'` | `'overall'` counts your API's own answers as agreeing; `'local'` certifies local answers alone. |
+
+## The verdict
+
+Every report includes a `verdict` — TinyDecide's plain-English recommendation about whether to ship the model:
+
+<CardGroup cols={2}>
+  <Card title="ship" icon="circle-check">
+    At least 25% of calibration calls cleared the cutoff. Worth deploying: savings are real and the certificate holds.
+  </Card>
+  <Card title="marginal" icon="circle-exclamation">
+    Between 5% and 25% of calls cleared the cutoff. The model works but savings are small. Consider whether the latency win is worth keeping it running.
+  </Card>
+  <Card title="not-worth-it" icon="circle-xmark">
+    Fewer than 5% of calls cleared the cutoff. A word-level model cannot copy this decision reliably. TinyDecide keeps calling your API and will tell you if a future compile changes the picture.
+  </Card>
+  <Card title="need-more-data" icon="clock">
+    Not enough calibration rows to run Learn-Then-Test at the requested `target` and `delta`. Keep shadowing and recompile when more answers arrive.
+  </Card>
+</CardGroup>
+
+The thresholds (25% for `ship`, 5% for `marginal`) are measured on calibration, not the test split, so the verdict is available as soon as the certificate is issued.
+
+## The Report object
+
+The full `Report` type returned by every compile:
+
+```typescript
+export interface Report {
+  verdict: Verdict;
+  /** One plain-English sentence. */
+  summary: string;
+  labels: string[];
+  target: number;
+  delta: number;
+  guarantee: 'overall' | 'local';
+  rows: { total: number; train: number; calib: number; test: number; skipped: number };
+  features: number;
+  epochs: number;
+  certificate: Certificate;
+  calib: { share: number; localAgreement: number | null; overallAgreement: number | null; rawAgreement: number | null };
+  /** What the cutoff did on held-out rows, with 95% Wilson intervals. */
+  test: {
+    n: number;
+    share: number;
+    overallAgreement: number;
+    overallCI: [number, number];
+    localAgreement: number | null;
+    localCI: [number, number] | null;
+    rawAgreement: number;
+    int8Flips: number;
+  } | null;
+  /** Share answered locally at other targets. */
+  whatIf: { target: number; share: number }[];
+  savings: { apiCallsAvoided: number; auditRate: number };
+  temperature: number;
+  bytes: number;
+  latencyUs: number;
+  ms: { train: number; total: number };
+}
+```
+
+Key fields to check after a compile:
+
+| Field | What to look for |
+|---|---|
+| `verdict` | `'ship'` to deploy; anything else means savings are limited or there isn't enough data yet |
+| `summary` | One sentence explaining the verdict in plain English |
+| `certificate` | The certificate object — check `cutoff`, `n`, `errors` |
+| `calib.share` | Fraction of calibration calls answered locally — the number that drives the verdict |
+| `test` | Held-out measurements, with Wilson 95% CIs — a sanity check on calibration |
+| `whatIf` | What `calib.share` would be at other targets — useful for deciding whether to relax `target` |
+| `savings.apiCallsAvoided` | Expected fraction of API calls saved in production (accounts for audit overhead) |
+| `latencyUs` | Median local answer time in microseconds, measured on the shipped int8 model |
+
+<Note>
+  The certificate covers traffic that looks like the calibration sample — the same distribution, the same label mix. It does not cover changes to your API's behavior after the model ships. Live checks handle that: see [Drift Detection](/guarantee/drift-detection).
+</Note>
+
+<Tip>
+  Use `compile: { guarantee: 'local' }` when you need local answers alone to be reliable — for example, when local answers feed a downstream system and API answers are reviewed separately. This answers fewer calls locally but gives you a stronger per-answer guarantee.
+</Tip>

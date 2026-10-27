@@ -1,0 +1,151 @@
+---
+title: "Use TinyDecide in Browsers, Workers, and Edge Runtimes"
+sidebarTitle: "Browsers & Edge"
+description: "Run TinyDecide in browser tabs, Service Workers, Cloudflare Workers, and edge runtimes using pre-compiled models with no Node dependencies."
+---
+
+TinyDecide's browser entry (`src/index.js`) has no Node dependencies and weighs 12 KB gzipped. The same `import { shadow } from 'tinydecide'` statement works in browser tabs, Service Workers, Cloudflare Workers, Deno Deploy, Vercel Edge Functions, and any other runtime that runs standard JavaScript — the bundler or runtime picks the right entry point automatically.
+
+## Importing TinyDecide
+
+```js
+import { shadow, Model } from 'tinydecide';
+```
+
+Bundlers (webpack, esbuild, Vite) use the `browser` condition in `package.json` exports to pick `src/index.js` instead of the Node entry. In Cloudflare Workers and Deno Deploy the same condition applies. No configuration is needed:
+
+```json
+// package.json exports (for reference — you don't write this)
+{
+  ".": {
+    "types":   "./types/index.d.ts",
+    "browser": "./src/index.js",
+    "node":    "./src/node.js",
+    "default": "./src/index.js"
+  }
+}
+```
+
+## Memory-only answers
+
+In browsers, workers, and edge runtimes there is no filesystem, so answers stay in memory. They do not persist across page reloads, Worker restarts, or edge invocations. Every cold start begins in `learning` mode and every call goes to your API until a model is loaded or compiled.
+
+To get local answers immediately on every page load, ship a pre-compiled model alongside your app and load it at startup.
+
+## Loading a pre-compiled model
+
+Compile a model once (on a server, in CI, or from a collected answer log) and serve the `.tdm` file as a static asset:
+
+```bash
+npx tinydecide compile answers.jsonl --out support.tdm
+```
+
+Then load it in the browser:
+
+```js
+import { shadow, Model } from 'tinydecide';
+
+const model = Model.fromBytes(
+  await (await fetch('/support.tdm')).arrayBuffer()
+);
+
+const classify = shadow('support', api, {
+  model,
+  autoCompile: false,
+});
+```
+
+The `fetch` call is a standard browser fetch. The `.tdm` file is typically 0.2–6 MB and can be served from a CDN. The `Model.fromBytes` call is synchronous and fast.
+
+## Disabling auto-compile
+
+Set `autoCompile: false` when you ship a compiled model and do not want TinyDecide to try compiling from the in-memory answer log:
+
+```js
+const classify = shadow('support', api, {
+  model,
+  autoCompile: false,
+});
+```
+
+With `autoCompile: false`, the model never changes during the page session. Compile on a schedule outside the browser (from a server-side answer store) and redeploy the `.tdm` file. The live agreement checks still run in the background and fall back to your API automatically if the model drifts.
+
+## Offline inference
+
+You can run a compiled model directly, without `shadow()`, using `model.decide()`:
+
+```js
+import { Model } from 'tinydecide';
+
+const model = Model.fromBytes(
+  await (await fetch('/support.tdm')).arrayBuffer()
+);
+
+// Synchronous, ~10 µs for short texts
+const decision = model.decide('my card was charged twice');
+// { choice: 'billing', index: 0, confidence: 0.94, margin: 2.1, local: true }
+
+console.log(decision.choice);      // 'billing'
+console.log(decision.confidence);  // 0.94
+console.log(decision.local);       // true when margin clears the certified cutoff
+```
+
+`model.decide()` ignores the certified cutoff check when called directly — `decision.local` tells you whether the margin would have cleared it. This is useful for offline classifiers, cached responses in a Service Worker, or any case where you want synchronous classification without a fallback API.
+
+## Service Workers
+
+The `tinydecide` import works in Service Worker context. You can use it to answer classification calls from the cache:
+
+```js
+// service-worker.js
+import { shadow, Model } from 'tinydecide';
+
+let classify;
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    (async () => {
+      const model = Model.fromBytes(
+        await (await fetch('/support.tdm')).arrayBuffer()
+      );
+      classify = shadow('support', api, { model, autoCompile: false });
+    })()
+  );
+});
+```
+
+Answers stay in memory for the lifetime of the Service Worker. If the worker is terminated and restarted, the model is reloaded from the fetch but the in-memory answer log starts fresh.
+
+## Cloudflare Workers, Deno Deploy, and Vercel Edge
+
+All three runtimes support the `browser` export condition and have no Node built-ins available — TinyDecide's browser entry uses none. There is nothing special to configure:
+
+```js
+// works in Cloudflare Workers, Deno Deploy, Vercel Edge Functions
+import { shadow, Model } from 'tinydecide';
+```
+
+In these runtimes each invocation is typically a new process with no shared memory. Load a compiled model at the top level so it is reused across invocations within the same isolate (Cloudflare Workers keeps isolates warm):
+
+```js
+// Top-level: executed once per isolate, not once per request
+const model = Model.fromBytes(
+  await (await fetch('https://assets.example.com/support.tdm')).arrayBuffer()
+);
+
+export default {
+  async fetch(request) {
+    const classify = shadow('support', api, { model, autoCompile: false });
+    const label = await classify(await request.text());
+    return new Response(label);
+  },
+};
+```
+
+<Note>
+  TinyDecide's browser bundle is 12 KB gzipped. It has no WASM, no native modules, and no external dependencies. The `Model.fromBytes()` call is synchronous and CPU-only; inference is pure JavaScript.
+</Note>
+
+## Build note
+
+When bundling with webpack, esbuild, or Vite, the `browser` condition in `package.json` is applied automatically. No aliases, no polyfills, and no special plugin is required. If you are bundling for a runtime that does not set the `browser` condition (some SSR setups), import directly from `tinydecide/src/index.js` to get the browser entry, or set the condition explicitly in your bundler config.

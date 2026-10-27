@@ -1,0 +1,115 @@
+---
+title: "TinyDecide Benchmark Results on Real Decision Traffic"
+sidebarTitle: "Benchmarks"
+description: "Benchmark results across 15 real decision tasks and a live LLM test: local share, agreement rates, guard false alarms, and detection speed."
+---
+
+These results come from two sources: a replay benchmark that compiles on the first N answers recorded from a production decision model and then measures agreement on held-out answers the model never saw, and one live test that wrapped a real LLM API. All 15 replay tasks use target 98%, delta 5%. The recorded traffic is research data and is not distributed.
+
+## Replay benchmark across 15 decisions
+
+<Note>
+  The replay benchmark uses recorded API responses — not a live API. Results are from replaying logged answers in order, not from calling an external service. This makes the results reproducible but means the traffic distribution is not the same as your production traffic.
+</Note>
+
+| Decision | Calls compiled | Answered locally | Agreement [95% CI] | Verdict |
+|---|---:|---:|---|---|
+| Toxic chat prompts | 2,000 | 87.2% | 98.3% [97.1–99.1] | ship |
+| Support intents (CLINC, 151 labels) | 10,000 | 73.1% | 98.6% [98.0–98.9] | ship |
+| PubMed sentence role † | 50,000 | 67.6% | 98.3% [97.7–98.7] | ship |
+| Economic news relevance | 2,000 | 67.1% | 99.2% [98.5–99.6] | ship |
+| Dialog emotion † | 20,000 | 62.4% | 98.2% [97.7–98.6] | ship |
+| Voice-assistant intents (SLURP, 60 labels) | 5,000 | 44.1% | 99.1% [98.6–99.4] | ship |
+| Adverse drug events | 10,000 | 38.1% | 98.3% [97.7–98.7] | ship |
+| Airline sentiment | 5,000 | 36.7% | 99.0% [98.4–99.3] | ship |
+| Hate / offensive speech | 10,000 | 31.6% | 98.5% [98.0–98.9] | ship |
+| Sarcastic headlines | 20,000 | 19.8% | 98.6% [98.1–99.0] | marginal |
+| Relation types (SemEval, 19 labels) | 5,000 | 19.5% | 98.5% [97.7–99.0] | marginal |
+| Sexism detection (EDOS) | 5,000 | 11.9% | 98.6% [98.0–99.0] | marginal |
+| Adversarial hate (DynaHate) | 5,000 | 7.5% | 99.4% [98.8–99.7] | marginal |
+| Scientific inference pairs (SciNLI) † | 20,000 | 4.1% | 99.1% [98.7–99.4] | not worth it |
+| Paraphrase pairs (PAWS) | 10,000 | 3.6% | 98.4% [97.8–98.8] | not worth it |
+
+† The recorded answers mix the decision model with other labellers.
+
+Across all 56 (decision, N) cells measured from 1,000 to 50,000 compile calls, 3 measured below 98% — close to the 5 that `delta = 0.05` allows — and 1 was clearly below. Pooled agreement across all tasks was **98.8%**. On a deliberately shifted future set built from clusters the compile never saw, 9 of 56 measured below and 2 clearly, illustrating the limits of word-level models on distribution shifts.
+
+## Live test against a real API
+
+To validate the guarantee outside of replay, TinyDecide was wrapped around an open-weights LLM on OpenRouter (Mistral Nemo) labelling 3,000 public airline tweets. Results:
+
+<CardGroup cols={2}>
+  <Card title="Total API cost" icon="credit-card">
+    **$0.0034** for 3,000 calls, including the first 2,000 training calls
+  </Card>
+  <Card title="Local share" icon="bolt">
+    **24%** of the last 1,000 calls answered locally after the first compile at 2,000 answers
+  </Card>
+  <Card title="Agreement" icon="circle-check">
+    **98.9% [98.0–99.4]** overall agreement with the API on those 1,000 calls
+  </Card>
+  <Card title="Latency" icon="gauge">
+    API p50 **541 ms** · local p50 **16.8 µs** — a 32,000× speedup on local calls
+  </Card>
+</CardGroup>
+
+## Guard check results
+
+### False alarms on real traffic
+
+All 15 recorded tasks were replayed through `shadow()` in order, with no simulated API change, at the default audit rate of 2% and the default compile schedule (up to 20,000 calls each). Any guard trip would be a false alarm.
+
+| Task | Calls | Answered locally | Installs | False alarms |
+|---|---:|---:|---:|---:|
+| PubMed sentence role | 20,000 | 34.5% | 3 | 0 |
+| Dialog emotion | 20,000 | 45.3% | 3 | 0 |
+| Sarcastic headlines | 20,000 | 7.5% | 4 | 0 |
+| SciNLI | 20,000 | 1.5% | 4 | 0 |
+| Hate / offensive speech | 20,000 | 7.8% | 4 | 0 |
+| PAWS | 17,820 | 2.1% | 4 | 0 |
+| Adverse drug events | 17,404 | 26.6% | 3 | 0 |
+| CLINC intents | 12,760 | 38.8% | 2 | 0 |
+| EDOS | 11,572 | 4.4% | 3 | 0 |
+| Airline sentiment | 11,453 | 26.6% | 3 | 0 |
+| SLURP intents | 8,935 | 27.3% | 2 | 0 |
+| DynaHate | 6,734 | 4.5% | 2 | 0 |
+| SemEval relations | 6,297 | 10.3% | 2 | 0 |
+| Economic news | 5,330 | 41.7% | 1 | 0 |
+| Toxic chat | 3,331 | 34.5% | 1 | 0 |
+| **Total** | **221,636** | | **41** | **0** |
+
+**Zero false alarms in 221,636 calls across 41 installed models.** The CUSUM-based audit check replaced an earlier sliding-window Wilson bound that raised one false alarm on toxic chat. Monte Carlo comparison over 2,000 audits per model life:
+
+| Audit check | False alarms per life, agreement exactly at target | At 98.8% | Audits to catch 10% / 15% errors (median) |
+|---|---:|---:|---:|
+| Sliding-window Wilson, z = 3 | 9.4% | 1.0% | 139 / 80 |
+| CUSUM over 2×, 4×, 8× the target error, h = 9 (shipped) | 1.8% | 0.0% | 82 / 41 |
+
+### Detection of an API change
+
+To measure how quickly the guard catches a real change, a simulated 10-label support API was set up to silently reclassify every `'billing'` answer as `'refund'` starting at call 7,700. The detection run was repeated 10 times with different random seeds.
+
+| Seed | Caught by | Calls to catch | Wrong local answers meanwhile |
+|---:|---|---:|---:|
+| 1 | deferred, "billing" | 953 | 88 |
+| 2 | deferred, "billing" | 977 | 75 |
+| 3 | deferred, overall | 754 | 25 |
+| 4 | deferred, "billing" | 1,221 | 57 |
+| 5 | deferred, "billing" | 3,657 | 309 |
+| 6 | deferred, "billing" | 2,688 | 253 |
+| 7 | deferred, "billing" | 2,031 | 131 |
+| 8 | deferred, "billing" | 1,230 | 110 |
+| 9 | deferred, "billing" | 876 | 51 |
+| 10 | deferred, "billing" | 2,055 | 163 |
+
+**Median: 1,226 calls to detect the change (range 754–3,657), with 25–309 wrong local answers in the window.** In every run, the deferred check caught the change — not the audit check. The per-label deferred check (which trips when observed agreement for a label falls 4 sigma below the model's own calibrated confidence) is what made this possible: without it, the same change went undetected for the rest of a 14,000-call run (about 6,300 calls, 15% of local answers wrong).
+
+## What these numbers mean for your app
+
+<Note>
+  The `delta = 0.05` setting means TinyDecide certifies each model at 95% confidence. In statistical terms, roughly 1 in 20 compiles may certify slightly below `target` just by chance — even when the model is genuinely good and the API hasn't changed. This is expected and by design: it is the price of a non-trivial statistical guarantee. Over many compiles (as the answer log grows and the model recompiles), the certificate reflects increasing evidence and the chance of a borderline miss shrinks.
+</Note>
+
+The observed miss rate in the replay benchmark — 3 out of 56 cells below 98%, with 1 clearly below — is consistent with the 5% allowance that `delta = 0.05` permits. If your app calls for stronger guarantees, lower `delta` (e.g. `delta: 0.01` for 99% confidence); this requires more calibration data before the first model ships.
+
+For more on how the certificate is produced and what each field means, see [Certification](/guarantee/certification).

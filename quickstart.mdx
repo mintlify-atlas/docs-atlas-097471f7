@@ -1,47 +1,151 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with TinyDecide in Under 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Install TinyDecide, run the built-in simulation, wrap your first decision API, and inspect local vs. API answers — all in under 5 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This page walks you through installing TinyDecide and wrapping your first decision API. By the end you will have a drop-in replacement for your existing call that logs answers, compiles a local model automatically, and routes confident calls away from your API — with no changes to the rest of your code.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Note>
+  TinyDecide requires **Node 22 or later**. It also runs under **Bun** with full support. In browsers, workers, and edge runtimes the same import works; answers stay in memory and the file store is unavailable.
+</Note>
 
 <Steps>
+
   <Step title="Install">
-    Describe how to install your product or sign up.
+    Add TinyDecide to your project with your package manager of choice.
+
+    <CodeGroup>
+      ```bash npm
+      npm install tinydecide
+      ```
+
+      ```bash bun
+      bun add tinydecide
+      ```
+
+      ```bash yarn
+      yarn add tinydecide
+      ```
+    </CodeGroup>
+
+    There are no dependencies. The package is 12 KB gzipped in a browser bundle.
+  </Step>
+
+  <Step title="Try the simulation">
+    Before touching your own API, run the built-in 15-second simulation. It needs no API key and no network access.
 
     ```bash
-    npm install your-package
+    npx tinydecide try
     ```
+
+    The simulation wraps a built-in support-ticket classifier, generates traffic, watches TinyDecide move through the learning → local transition, then changes the API mid-stream and watches the guard trip and recovery. It is the fastest way to see the full lifecycle — including the drift-detection guard — without writing any code.
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Wrap your API">
+    Import `shadow` and pass it a name and your existing function. The name identifies the decision in logs and, in Node, names the folder under `.tinydecide/` where answers and the model are stored.
+
+    ```js
+    import { shadow } from 'tinydecide';
+
+    // Your existing call — one input in, one label out
+    async function classify(text) {
+      const res = await fetch(`${BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.LLM_API_KEY}` },
+        body: JSON.stringify({
+          model: MODEL,
+          temperature: 0,
+          max_tokens: 4,
+          messages: [
+            { role: 'system', content: `Label the support message. Reply with one word: billing, login, bug, cancel, other.` },
+            { role: 'user', content: text },
+          ],
+        }),
+      });
+      const reply = (await res.json()).choices[0].message.content.trim().toLowerCase();
+      return ['billing', 'login', 'bug', 'cancel', 'other'].find((l) => reply.startsWith(l)) ?? 'other';
+    }
+
+    // Drop-in replacement: same call signature, same return value
+    const route = shadow('support-route', classify, { labels: ['billing', 'login', 'bug', 'cancel', 'other'] });
+
+    // Use it exactly like the original
+    const label = await route('my card was charged twice');
+    ```
+
+    The `labels` option is needed when your API may not return every label in the first 2,000 calls. It also fixes the order when your API returns probability arrays.
+  </Step>
+
+  <Step title="Read the log output">
+    TinyDecide prints one line each time something changes — never once per call. Here are the three key lines and what they mean.
+
+    ```
+    [tinydecide] support: learning from your API. First compile after 2,000 answers.
+    ```
+    The decision is in **learning** mode. Every call still goes to your API. This line appears on startup.
+
+    ```
+    [tinydecide] support: compiled from 2,000 answers: answers 60% of calls locally, with ≥ 98% agreement with your API certified at 95% confidence. 0.16 MB, 8.1 µs per call.
+    ```
+    The local model is installed and the decision is in **local** mode. 60% of future calls will be answered in about 8 µs without touching your API.
+
+    ```
+    [tinydecide] support: your API's answers changed for "billing": on calls the model leaned toward "billing" but left to your API, they now agree 9% of the time where the model expected 47%. Every call goes to your API until a model trained on its new answers certifies.
+    ```
+    The **guard tripped**. The decision is in **guarded** mode. Every call goes back to your API. TinyDecide will compile a new model on the post-change answers and switch back to local automatically.
+
+    To silence the log or route it to your own logger, pass `log: false` or `log: (line, event) => logger.info(line)`.
+  </Step>
+
+  <Step title="Inspect individual decisions">
+    Call `decide.detailed(input)` instead of `decide(input)` to get the answer plus metadata about where it came from.
+
+    ```js
+    const { value, source, choice, confidence, ms } = await route.detailed('the app crashes when I log in');
+
+    console.log(value);      // 'bug'
+    console.log(source);     // 'local' | 'api' | 'fallback'
+    console.log(confidence); // 0.94 — the local model's confidence; null when your API answered
+    console.log(ms);         // 0.012 — wall time in milliseconds
+    ```
+
+    The `source` field tells you exactly who answered:
+    - `'local'` — the local model answered; your API was not called
+    - `'api'` — your API answered (model deferred, or still learning)
+    - `'fallback'` — your API threw and `fallback: true` was set; the local model answered instead
+  </Step>
+
+  <Step title="Check status">
+    At any time, inspect every decision stored in `.tinydecide/` with the CLI:
 
     ```bash
-    your-cli init
+    npx tinydecide status
     ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+    This prints a table showing the mode, call counts, local share, live agreement, and model age for every named decision in the current directory. Pass a path to check a different folder:
 
     ```bash
-    your-cli start
+    npx tinydecide status /var/data/.tinydecide
+    ```
+
+    You can also read the same data in code:
+
+    ```js
+    const stats = route.stats();
+    // {
+    //   name: 'support-route', mode: 'local', calls: 4821, local: 2891,
+    //   share: 0.60, apiCallsSaved: 2794,
+    //   live: { sampled: 96, agreement: 0.99, ci: [0.944, 0.999] },
+    //   model: { labels: 5, cutoff: 1.23, expectedShare: 0.60, created: '2025-06-01T...' }
+    // }
     ```
   </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Next Steps
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+For a complete walkthrough of wrapping an LLM — including OpenRouter, vLLM, and Ollama — see the [Wrapping an LLM guide](/guides/wrapping-an-llm).
+
+The full option reference, custom `store` setup, and serverless deployment patterns are in the [README](https://github.com/Christian1011/tinydecide#readme).

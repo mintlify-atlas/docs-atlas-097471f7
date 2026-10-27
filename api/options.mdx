@@ -1,0 +1,346 @@
+---
+title: "ShadowOptions — All Configuration Options for shadow()"
+sidebarTitle: "Options"
+description: "Complete ShadowOptions reference for shadow(): agreement targets, compile schedule, drift detection, logging, persistence, and all defaults."
+---
+
+`ShadowOptions` configures agreement targets, compilation schedule, drift detection, logging, and persistence for a decision wrapped with `shadow()`. Every field is optional — the defaults work out of the box for most cases. Misspelled options and out-of-range numeric values throw at startup with a message that says what to write instead.
+
+```ts
+import { shadow } from 'tinydecide';
+
+const classify = shadow('support', (text) => api.classify(text), {
+  target: 0.98,
+  audit: 0.02,
+  fallback: true,
+  log: (line) => logger.info(line),
+});
+```
+
+The table below summarizes every option. Full documentation for each follows.
+
+| Option | Default | Summary |
+|---|---|---|
+| `target` | `0.98` | Agreement to certify, overall across all calls |
+| `delta` | `0.05` | 1 − confidence of the certificate |
+| `audit` | `0.02` | Share of local calls re-sent to your API to check live agreement |
+| `labels` | inferred | Fixes the label set and order |
+| `model` | none | Start from a compiled model |
+| `autoCompile` | `{ min: 2000, growth: 2, maxEvery: 20000, window: 50000 }` | When to compile; `false` = only on `decide.compile()` |
+| `store` | file in Node, memory elsewhere | Where answers, the model and state live |
+| `dir` | `.tinydecide` | Node: folder that holds named decisions |
+| `group` | none | Keeps related calls in the same certification split |
+| `fallback` | `false` | Answer locally when your API throws |
+| `choice` | built-in | Reads label from custom response shapes |
+| `respond` | built-in | Builds local answers in a custom shape |
+| `compile` | `{}` | Extra options forwarded to each compile |
+| `compiler` | worker thread (Node) | Replaces the compile function |
+| `log` | `true` | One line per lifecycle event |
+| `onEvent` | none | Every event as a structured object |
+| `random` | `Math.random` | Source of randomness for the audit sample |
+
+---
+
+## Agreement options
+
+<ParamField body="target" type="number" default="0.98">
+  The agreement with your API to certify, measured overall across all calls. Your API's own answers count as agreeing, so this is the minimum fraction of all traffic — local and deferred — that matches your API's answer.
+
+  Must be strictly between `0` and `1`. Throws at startup if out of range.
+
+  Changing the target requires recompiling the model. Use `--target` with `tinydecide compile` or set `target` in `ShadowOptions` and call `decide.compile()`.
+</ParamField>
+
+<ParamField body="delta" type="number" default="0.05">
+  One minus the confidence of the certificate. A `delta` of `0.05` means the certificate holds at 95% confidence over the calibration draw.
+
+  Must be strictly between `0` and `1`. Throws at startup if out of range.
+
+  Lower values demand more calibration rows to certify the same target. The certificate is a statistical guarantee, not a hard constraint — the live audit check monitors agreement continuously and falls back to your API if it drops.
+</ParamField>
+
+<ParamField body="audit" type="number" default="0.02">
+  The share of calls your API also answers in the background to check live agreement. A uniform random sample (iid over traffic) is re-sent to your API and compared to the model's answer. Both the live CUSUM drift check and calibration use only this sample.
+
+  Must be in `[0, 1]`. Throws at startup if out of range. Setting `audit` to `0` disables the live check entirely; only the deferred check (calls the model does not answer anyway) will catch API changes.
+
+  Higher values catch API changes sooner at the cost of more API calls. Lower values save more but take longer to detect drift.
+</ParamField>
+
+---
+
+## Label options
+
+<ParamField body="labels" type="string[]">
+  Fixes the label set and its order. When set, any label from your API that is not in this list is appended dynamically, and the model's label index is tied to this order.
+
+  **Required** when your API returns probability arrays (e.g. `[0.1, 0.8, 0.1]`) — TinyDecide needs the order to map array positions to label names.
+
+  Also used to name index labels when your API returns a numeric label (e.g. `2` → `labels[2]`).
+
+  ```ts
+  const classify = shadow('intent', api, {
+    labels: ['billing', 'cancellation', 'shipping', 'technical'],
+  });
+  ```
+</ParamField>
+
+---
+
+## Model options
+
+<ParamField body="model" type="Model">
+  Start from a pre-compiled model instead of waiting for the first automatic compile. Useful for:
+
+  - **Serverless and edge deployments**, where there are no persistent answers to compile from
+  - **Browsers and workers**, where the file system is unavailable
+  - **Fast cold starts**, where you ship a model compiled centrally and load it at startup
+
+  ```ts
+  import { loadModel, shadow } from 'tinydecide';
+
+  const classify = shadow('support', api, {
+    model: loadModel('support.tdm'),
+    autoCompile: false,
+  });
+  ```
+
+  Pair with `autoCompile: false` when you manage recompilation centrally with `tinydecide compile`.
+</ParamField>
+
+<ParamField body="autoCompile" type="false | AutoCompileOptions" default='{ min: 2000, growth: 2, maxEvery: 20000, window: 50000 }'>
+  Controls when TinyDecide compiles automatically. Pass `false` to disable automatic compilation entirely — compiles only happen when you call `decide.compile()`.
+
+  When an object is passed, it is merged with the defaults:
+
+  <Expandable title="AutoCompileOptions fields">
+
+  <ParamField body="min" type="number" default="2000">
+    Answers before the first compile. Also the minimum gap between recompiles.
+  </ParamField>
+
+  <ParamField body="growth" type="number" default="2">
+    Recompile when the number of logged answers has grown by this factor since the last compile. A value of `2` means recompile when answers double.
+  </ParamField>
+
+  <ParamField body="maxEvery" type="number" default="20000">
+    Even if answers haven't doubled, recompile at least every this many new answers. Prevents very large logs from going stale.
+  </ParamField>
+
+  <ParamField body="window" type="number" default="50000">
+    Use only the most recent this many answers for each compile. Keeps compile time bounded and weights recent traffic higher.
+  </ParamField>
+
+  </Expandable>
+
+  ```ts
+  shadow('support', api, {
+    autoCompile: { min: 5000, growth: 1.5, maxEvery: 10000 },
+  });
+  ```
+</ParamField>
+
+---
+
+## Persistence options (Node)
+
+<ParamField body="store" type="Store">
+  Where TinyDecide keeps answers, the compiled model, and the guarded state. Must implement `append(record)` and `load()`. All other methods are optional.
+
+  **Default behavior:**
+  - In Node with a named decision (`shadow('support', api)`): a `fileStore` under `.tinydecide/support/`
+  - Everywhere else (anonymous, browser, worker): a `memoryStore`
+
+  Use a custom store to persist answers in a database, send them to a shared service, or control the answer log's lifecycle:
+
+  ```ts
+  import { shadow } from 'tinydecide';
+
+  const classify = shadow('support', api, {
+    store: {
+      append: (record) => db.insert(record),
+      load: () => db.selectAll(),
+      size: db.count(),
+    },
+  });
+  ```
+
+  See [`Store`](/api/types#store) for the full interface.
+</ParamField>
+
+<ParamField body="dir" type="string" default='".tinydecide" or $TINYDECIDE_DIR'>
+  The folder that holds named decisions in Node. Each decision gets a subfolder named after it: `dir/support/answers.jsonl`, `dir/support/model.tdm`, etc.
+
+  Only valid when passing a named decision. Passing `dir` without a name throws.
+
+  The environment variable `$TINYDECIDE_DIR` is used as a fallback default when the option is not set.
+
+  ```ts
+  shadow('support', api, { dir: '/var/data/decisions' });
+  ```
+</ParamField>
+
+<Warning>
+  Passing `dir` without a named decision — i.e. calling `shadow(api, { dir })` instead of `shadow('name', api, { dir })` — throws immediately with a descriptive error message.
+</Warning>
+
+---
+
+## Routing options
+
+<ParamField body="group" type="(input: I) => string | number | null | undefined">
+  Maps an input to a group identifier. Calls in the same group are kept together when the logged answers are split into train, calibration and test sets.
+
+  Without grouping, the split is by normalized text so exact repeats never leak across splits. With grouping, all calls in a conversation or from a customer land in the same split — so the certificate covers new conversations or new customers, not just new messages.
+
+  ```ts
+  shadow('intent', api, {
+    group: (input) => input.conversationId,
+  });
+  ```
+
+  Return `null` or `undefined` to exclude a call from grouping.
+</ParamField>
+
+<ParamField body="fallback" type="boolean" default="false">
+  When `true`, if your API throws and a local model exists, TinyDecide answers with the model instead of re-throwing. The `source` field in `detailed()` will be `'fallback'`.
+
+  When `false` (the default), any exception from your API is re-thrown unchanged. TinyDecide never makes a call fail that would have succeeded without it.
+
+  ```ts
+  shadow('support', api, { fallback: true });
+  ```
+</ParamField>
+
+---
+
+## Response shape options
+
+<ParamField body="choice" type="(response: R, labels: string[] | undefined) => string | { choice: string | null; probs?: Record<string, number> | null } | null | undefined">
+  Reads the label (and optionally probabilities) from your API's response. The built-in reader handles these shapes automatically — you only need this when your API uses an unusual structure:
+
+  - A bare string: `'billing'`
+  - An object with `choice`, `label`, `decision`, or `answer`, plus optional `probs`
+
+  Return a string label, or `{ choice, probs }`. Return `null` to signal that the response is not readable.
+
+  ```ts
+  shadow('support', api, {
+    choice: (response) => ({
+      choice: response.intents[0]?.name ?? null,
+      probs: Object.fromEntries(response.intents.map((i) => [i.name, i.score])),
+    }),
+  });
+  ```
+</ParamField>
+
+<ParamField body="respond" type="(decision: Decision, shape: ResponseShape | null) => R">
+  Builds a local answer in the same shape as your API's response. The built-in implementation mirrors your API's shape automatically (string for string, same key for an object, same probs format). You only need this when the automatic mirroring is not enough:
+
+  ```ts
+  shadow('support', api, {
+    respond: (decision, shape) => ({
+      intents: [{ name: decision.choice, score: decision.confidence }],
+    }),
+  });
+  ```
+
+  `decision` is a [`Decision`](/api/types#decision). `shape` is the inferred [`ResponseShape`](/api/types#responseshape), or `null` if no response has been seen yet.
+</ParamField>
+
+---
+
+## Compile options
+
+<ParamField body="compile" type="Partial<Omit<CompileOptions, 'target' | 'delta' | 'audit' | 'labels'>>">
+  Extra options forwarded to each compile triggered by the automatic schedule or by `decide.compile()`. `target`, `delta`, `audit`, and `labels` are set at the top level of `ShadowOptions` and cannot be overridden here.
+
+  Useful for controlling the guarantee type, random seed, or training hyperparameters:
+
+  ```ts
+  shadow('support', api, {
+    compile: { guarantee: 'local', seed: 42 },
+  });
+  ```
+
+  See [`CompileOptions`](/api/types#compileoptions) for all available fields.
+</ParamField>
+
+<ParamField body="compiler" type="(rows: AnswerRecord[], options: CompileOptions & { background?: boolean }) => Promise<{ model: Model; report: Report }>">
+  Replaces the compile function entirely. In Node, the default compiles in a worker thread so training never blocks the main thread. In browsers and non-Node runtimes, it runs on the main thread.
+
+  Pass a custom compiler to:
+  - Offload compiles to an external service
+  - Add custom preprocessing
+  - Inject a different model architecture
+
+  ```ts
+  shadow('support', api, {
+    compiler: (rows, opts) => fetch('/api/compile', {
+      method: 'POST',
+      body: JSON.stringify({ rows, opts }),
+    }).then((r) => r.json()),
+  });
+  ```
+</ParamField>
+
+---
+
+## Observability options
+
+<ParamField body="log" type="boolean | ((line: string, event: ShadowEvent) => void)" default="true">
+  Controls the built-in lifecycle log. TinyDecide logs one line when something changes (a compile finishes, a guard trips, a model is installed), never per call.
+
+  - `true` (default) — logs via `console.info`
+  - `false` — silent
+  - A function `(line, event) => void` — routes the log line to your own logger; `event` is the full [`ShadowEvent`](/api/types#shadowevent) for structured logging
+
+  ```ts
+  shadow('support', api, {
+    log: (line, event) => {
+      logger.info(line, { type: event.type });
+    },
+  });
+  ```
+</ParamField>
+
+<ParamField body="onEvent" type="(event: ShadowEvent) => void">
+  Called with every lifecycle event as a structured [`ShadowEvent`](/api/types#shadowevent) object. Unlike `log`, this fires even for events that don't produce a log line (like `audit`).
+
+  Use `onEvent` to push metrics, trigger alerts, or record compile reports:
+
+  ```ts
+  shadow('support', api, {
+    onEvent: (event) => {
+      if (event.type === 'guard') {
+        alerting.fire('tinydecide.guard', event);
+      }
+      if (event.type === 'install') {
+        metrics.record('tinydecide.share', event.share);
+      }
+    },
+  });
+  ```
+</ParamField>
+
+---
+
+## Other options
+
+<ParamField body="random" type="() => number" default="Math.random">
+  Source of randomness for the audit sample. Each call is audited independently with probability `audit`. Override to use a seeded PRNG for reproducible tests or replays:
+
+  ```ts
+  import { mulberry32 } from './prng.js';
+
+  shadow('support', api, {
+    random: mulberry32(42),
+  });
+  ```
+</ParamField>
+
+---
+
+<Note>
+  All numeric options (`target`, `delta`, `audit`) are validated at startup. An invalid value throws immediately with a message telling you the accepted range — for example: `tinydecide: target must be a number between 0 and 1; got 1.5`.
+</Note>
