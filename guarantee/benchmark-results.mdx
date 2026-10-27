@@ -1,7 +1,7 @@
 ---
 title: "TinyDecide Benchmark Results on Real Decision Traffic"
 sidebarTitle: "Benchmarks"
-description: "Benchmark results across 15 real decision tasks and a live LLM test: local share, agreement rates, guard false alarms, and detection speed."
+description: "Replay benchmark across 15 real decision tasks: certified local share, agreement CIs, guard false alarms, and API-change detection speed."
 ---
 
 These results come from two sources: a replay benchmark that compiles on the first N answers recorded from a production decision model and then measures agreement on held-out answers the model never saw, and one live test that wrapped a real LLM API. All 15 replay tasks use target 98%, delta 5%. The recorded traffic is research data and is not distributed.

@@ -55,7 +55,7 @@ const classify = shadow('support', api, {
 });
 ```
 
-The `fetch` call is a standard browser fetch. The `.tdm` file is typically 0.2–6 MB and can be served from a CDN. The `Model.fromBytes` call is synchronous and fast.
+The `fetch` call is a standard browser fetch. The `.tdm` file is typically 0.2–6 MB and can be served from a CDN. `Model.fromBytes` accepts either a `Uint8Array` or an `ArrayBuffer` — `.arrayBuffer()` returns an `ArrayBuffer`, which works directly. The call is synchronous and fast.
 
 ## Disabling auto-compile
 
@@ -148,4 +148,4 @@ export default {
 
 ## Build note
 
-When bundling with webpack, esbuild, or Vite, the `browser` condition in `package.json` is applied automatically. No aliases, no polyfills, and no special plugin is required. If you are bundling for a runtime that does not set the `browser` condition (some SSR setups), import directly from `tinydecide/src/index.js` to get the browser entry, or set the condition explicitly in your bundler config.
+When bundling with webpack, esbuild, or Vite, the `browser` condition in `package.json` is applied automatically. No aliases, no polyfills, and no special plugin is required. If you are bundling for a runtime that does not set the `browser` condition (some SSR setups), set the condition explicitly in your bundler config — for example, `conditions: ['browser']` in esbuild or `resolve.conditions: ['browser']` in Vite.

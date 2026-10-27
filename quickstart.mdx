@@ -1,5 +1,5 @@
 ---
-title: "Get Started with TinyDecide in Under 5 Minutes"
+title: "Install TinyDecide and Wrap Your First Decision API"
 sidebarTitle: "Quickstart"
 description: "Install TinyDecide, run the built-in simulation, wrap your first decision API, and inspect local vs. API answers — all in under 5 minutes."
 ---
@@ -7,7 +7,7 @@ description: "Install TinyDecide, run the built-in simulation, wrap your first d
 This page walks you through installing TinyDecide and wrapping your first decision API. By the end you will have a drop-in replacement for your existing call that logs answers, compiles a local model automatically, and routes confident calls away from your API — with no changes to the rest of your code.
 
 <Note>
-  TinyDecide requires **Node 22 or later**. It also runs under **Bun** with full support. In browsers, workers, and edge runtimes the same import works; answers stay in memory and the file store is unavailable.
+  TinyDecide requires **Node 22 or later**. It also runs under **Bun** with full support. In browsers, workers, and edge runtimes the same import works; answers stay in memory and the file store is unavailable. Misspelled option names and out-of-range values for `target`, `delta`, or `audit` throw at startup with a message that says what to write instead.
 </Note>
 
 <Steps>
@@ -80,18 +80,18 @@ This page walks you through installing TinyDecide and wrapping your first decisi
   <Step title="Read the log output">
     TinyDecide prints one line each time something changes — never once per call. Here are the three key lines and what they mean.
 
-    ```
-    [tinydecide] support: learning from your API. First compile after 2,000 answers.
+    ```text
+    [tinydecide] support-route: learning from your API. First compile after 2,000 answers.
     ```
     The decision is in **learning** mode. Every call still goes to your API. This line appears on startup.
 
-    ```
-    [tinydecide] support: compiled from 2,000 answers: answers 60% of calls locally, with ≥ 98% agreement with your API certified at 95% confidence. 0.16 MB, 8.1 µs per call.
+    ```text
+    [tinydecide] support-route: compiled from 2,000 answers: answers 60% of calls locally, with ≥ 98% agreement with your API certified at 95% confidence. 0.16 MB, 8.1 µs per call.
     ```
     The local model is installed and the decision is in **local** mode. 60% of future calls will be answered in about 8 µs without touching your API.
 
-    ```
-    [tinydecide] support: your API's answers changed for "billing": on calls the model leaned toward "billing" but left to your API, they now agree 9% of the time where the model expected 47%. Every call goes to your API until a model trained on its new answers certifies.
+    ```text
+    [tinydecide] support-route: your API's answers changed for "billing": on calls the model leaned toward "billing" but left to your API, they now agree 9% of the time where the model expected 47%. Every call goes to your API until a model trained on its new answers certifies.
     ```
     The **guard tripped**. The decision is in **guarded** mode. Every call goes back to your API. TinyDecide will compile a new model on the post-change answers and switch back to local automatically.
 
@@ -114,6 +114,8 @@ This page walks you through installing TinyDecide and wrapping your first decisi
     - `'local'` — the local model answered; your API was not called
     - `'api'` — your API answered (model deferred, or still learning)
     - `'fallback'` — your API threw and `fallback: true` was set; the local model answered instead
+
+    To run the local model directly (bypassing the cutoff check), call `route.local(input)`. It returns a `Decision` object with `choice`, `confidence`, `margin`, and `local`, or `null` before the first model is loaded.
   </Step>
 
   <Step title="Check status">

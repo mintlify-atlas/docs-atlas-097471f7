@@ -1,10 +1,16 @@
 ---
 title: "TinyDecide: Wrap Your Decision API, Answer Locally"
 sidebarTitle: "Introduction"
-description: "TinyDecide wraps any decision API, learns from its answers, and answers calls locally in microseconds with conformal-prediction certified agreement."
+description: "TinyDecide wraps any decision API, learns from its answers, and answers calls locally in microseconds with certified agreement — no config required."
 ---
 
 TinyDecide is an npm library for developers who call a decision API — an LLM classifier, a hosted ML model, a routing service — on every request. It wraps that function transparently, logs answers in the background, trains a tiny local model, certifies how far to trust it, and then starts answering the calls it is sure about in about 10 µs. Your API stays the reference: TinyDecide only takes over where agreement is certified, and switches back automatically when your API changes.
+
+Install with npm or Bun on **Node 22+**:
+
+```bash
+npm install tinydecide    # or: bun add tinydecide
+```
 
 ## What TinyDecide Does
 
@@ -32,8 +38,38 @@ A decision moves through three modes as it learns. Each transition is logged wit
 | **guarded** | Your API, every call | A compile on answers given after the change certifies |
 
 <Note>
-  The thresholds above are defaults. The first compile triggers at `autoCompile.min` answers (default 2,000). Recompiles happen each time the answer count doubles, and at least every 20,000 answers.
+  The thresholds above are defaults. The first compile triggers at `autoCompile.min` answers (default 2,000). Recompiles happen each time the answer count doubles, and at least every 20,000 answers. Misspelled options and out-of-range values for `target`, `delta`, or `audit` throw at startup with a message that says what to write instead.
 </Note>
+
+## Public API
+
+TinyDecide exports four symbols from `'tinydecide'` that run in every environment — browsers, workers, edge runtimes, and Node:
+
+| Export | Purpose |
+|---|---|
+| `shadow(name, api, options?)` | Wraps your API and returns a `Decide` function |
+| `compile(records, options?)` | Trains and certifies a model from logged answer records |
+| `Model` | The compiled model class — load with `Model.fromBytes(bytes)` |
+| `memoryStore(options?)` | In-memory store; the default outside Node |
+
+In Node, three additional exports handle files and serialization:
+
+| Export | Purpose |
+|---|---|
+| `fileStore(dir, options?)` | Keeps answers, model, and state in a folder |
+| `loadModel(path)` | Reads a `.tdm` model file |
+| `saveModel(path, model)` | Writes a `.tdm` file atomically |
+| `readJsonl(path, options?)` | Reads `.jsonl` or `.jsonl.gz` answer logs |
+
+The `Decide` interface returned by `shadow()` exposes:
+
+- `decide(input)` — async, returns your API's response shape
+- `decide.detailed(input)` — returns `{ value, source, choice, confidence, ms }`
+- `decide.local(input)` — runs the local model synchronously; returns `null` before the first model
+- `decide.compile()` — compiles now, outside the normal schedule
+- `decide.stats()` — current mode, counts, live agreement, and model info
+- `decide.ready` — resolves once a saved model and state are loaded
+- `decide.close()` — stops compiling and closes the store; also available as `Symbol.asyncDispose` for use with `await using`
 
 ## Key Guarantees
 

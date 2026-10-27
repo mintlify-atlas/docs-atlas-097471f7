@@ -6,6 +6,36 @@ description: "Internals of TinyDecide's pipeline: feature extraction, fastText-s
 
 This page explains the complete pipeline that TinyDecide runs from the moment your API gives its first answer to the moment a certified local model is answering calls in microseconds. It covers feature extraction, model architecture, the train/calibrate/test split, the conformal-prediction certificate, the autoCompile schedule, and the three live checks that watch for API drift.
 
+## Public Exports
+
+TinyDecide exports four symbols that work in every environment — Node, Bun, browsers, workers, and edge runtimes:
+
+| Export | What it does |
+|---|---|
+| `shadow(name, api, options?)` | Wraps your API and returns a `Decide` function |
+| `compile(records, options?)` | Trains and certifies a model from answer records |
+| `Model` | The compiled model class; load from bytes with `Model.fromBytes(buffer)` |
+| `memoryStore(options?)` | In-memory store — the default outside Node |
+
+Three additional exports are available in Node only:
+
+| Export | What it does |
+|---|---|
+| `fileStore(dir, options?)` | Persists answers, model, and state in a folder |
+| `loadModel(path)` | Reads a `.tdm` model file |
+| `saveModel(path, model)` | Writes a `.tdm` file atomically |
+| `readJsonl(path, options?)` | Reads `.jsonl` or `.jsonl.gz` answer logs |
+
+The `Decide` interface returned by `shadow()` provides these members:
+
+- `decide(input)` — async call that returns your API's response shape
+- `decide.detailed(input)` — returns `{ value, source, choice, confidence, ms }`; `source` is `'local'`, `'api'`, or `'fallback'`
+- `decide.local(input)` — runs the local model synchronously without applying the cutoff check; returns `null` before the first model loads
+- `decide.compile()` — triggers a compile now, outside the normal schedule
+- `decide.stats()` — current mode, call counts, live agreement, and model metadata
+- `decide.ready` — a Promise that resolves once a saved model and state are loaded
+- `decide.close()` — stops compiling and closes the store; also wired to `Symbol.asyncDispose` for use with `await using`
+
 ## Feature Extraction
 
 Before training, every input is converted into a fixed-length feature vector. The steps are:
@@ -29,7 +59,7 @@ The local model is a fastText-style linear classifier with one structural refine
 - **Embedding bags.** Word features index one embedding matrix; character features index another. Both are averaged (pooled) across the tokens in their group, then added together before the linear head.
 - **Training.** The model is trained with SGD on your API's soft labels. When your API returns probability distributions (via the `probs` field), those distributions are used as training targets, so the model learns from your API's uncertainty rather than just the top-1 prediction.
 - **Quantization.** After training, weights are quantized to **int8** with one scale per row. Every number in the compile report — agreement, latency, the certificate — is measured on the int8 model that ships. There is no float32 reference model in production.
-- **Temperature.** A scalar temperature is fitted on the calibration rows to make the reported `confidence` match how often your API actually agrees with the model's top prediction. The temperature does not affect the margin cutoff — only the confidence value returned in `decide.detailed()`.
+- **Temperature.** A scalar temperature is fitted on the calibration rows to make the reported `confidence` match how often your API actually agrees with the model's top prediction. The temperature does not affect the margin cutoff — only the confidence value returned in `decide.detailed()` and `decide.local()`.
 
 ## Training and Compilation
 
@@ -51,21 +81,19 @@ The model trains on the train partition, then is quantized to int8. The quantize
 
 On the calibration rows, TinyDecide runs **Learn-Then-Test** with fixed-sequence binomial testing over a pre-fixed grid of margin cutoffs. The grid runs from 0 to 60 across 601 points on a log scale:
 
-```
+```text
 [0, 0.01, 0.013, …, 60]
 ```
 
-For each cutoff, it counts how many calibration rows would be answered locally and how many of those disagree with your API. It picks the **loosest cutoff** for which:
+**The score is the gap between the top two logits.** A call is answered locally if and only if this margin meets or exceeds the certified cutoff. A high margin means the model is confident the top class is right; a low margin means two classes are close and the call is deferred to your API.
+
+For each cutoff, TinyDecide counts how many calibration rows would be answered locally and how many of those disagree with your API. It picks the **loosest cutoff** for which:
 
 > With probability at least 1 − `delta` over the calibration draw, agreement with your API on traffic like the calibration rows is at least `target`.
 
 The cutoff grid is fixed before calibration is observed — this is what Learn-Then-Test requires, and what makes the guarantee valid.
 
-### 4. The margin
-
-**The score is the gap between the top two logits.** A call is answered locally if and only if this margin meets or exceeds the certified cutoff. A high margin means the model is confident the top class is right; a low margin means two classes are close and the call is deferred to your API.
-
-### 5. Report
+### 4. Report
 
 The test partition provides a held-out measurement of what the certified cutoff actually does on data the model never saw. The report includes local share, overall agreement, Wilson intervals, a `whatIf` table of other targets, and latency measured on the int8 model.
 

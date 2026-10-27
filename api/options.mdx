@@ -4,7 +4,7 @@ sidebarTitle: "Options"
 description: "Complete ShadowOptions reference for shadow(): agreement targets, compile schedule, drift detection, logging, persistence, and all defaults."
 ---
 
-`ShadowOptions` configures agreement targets, compilation schedule, drift detection, logging, and persistence for a decision wrapped with `shadow()`. Every field is optional — the defaults work out of the box for most cases. Misspelled options and out-of-range numeric values throw at startup with a message that says what to write instead.
+`ShadowOptions` configures agreement targets, compilation schedule, drift detection, logging, and persistence for a decision wrapped with `shadow()`. Every field is optional — the defaults work out of the box for most cases. Misspelled options throw at startup with a `TypeError` like `tinydecide: unknown option "targett". Options: target, delta, …`, and out-of-range numeric values throw with a message that says the accepted range.
 
 ```ts
 import { shadow } from 'tinydecide';

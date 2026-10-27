@@ -1,7 +1,7 @@
 ---
-title: "How TinyDecide Certifies Agreement with Your API"
+title: "How TinyDecide Certifies Agreement with Your Decision API"
 sidebarTitle: "Certification"
-description: "How TinyDecide uses conformal prediction to certify that a local model agrees with your API at a guaranteed rate, and how to configure it."
+description: "Certifies agreement with conformal prediction: certificate fields, verdict thresholds, and how to tune target, delta, and guarantee mode."
 ---
 
 TinyDecide uses a technique called Learn-Then-Test — a form of conformal prediction — to certify that its local model's answers agree with your API at a statistically guaranteed rate. Before any local answer is ever shown to your users, a certificate is issued: with probability at least `1 − delta` over the sample it learned from, agreement between the local model and your API on traffic like that sample will be at least `target`. No model ships without a certificate. If the math doesn't close, TinyDecide tells you, keeps calling your API, and tries again when more data arrives.

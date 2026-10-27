@@ -116,7 +116,7 @@ fileStore(dir: string, options?: { limit?: number }): Store & { readonly dir: st
 
 Keeps one decision in a folder on disk. This is what `shadow('name', api)` uses automatically in Node. Files written:
 
-```
+```text
 <dir>/
   answers.jsonl    your API's recent answers, trimmed to the newest `limit` lines
   model.tdm        the installed model
@@ -127,7 +127,7 @@ Keeps one decision in a folder on disk. This is what `shadow('name', api)` uses 
 
 On first use, `fileStore` also writes a `.gitignore` in the **parent** of `dir`:
 
-```
+```text
 # created by tinydecide: answers.jsonl holds raw inputs
 *
 ```
@@ -228,5 +228,5 @@ const classify = shadow('support', (text) => api.classify(text), { store });
 For full details on building a custom store — including multi-instance deployments and centralized answer logging — see [Custom Stores](/guides/custom-store).
 
 <Warning>
-  `fileStore` throws if another process already holds the lock file for that folder. The first process to open the folder keeps it exclusively; subsequent processes receive the error and fall back to `memoryStore` with one log line. This prevents two concurrent trims from racing and losing answers. If you need multiple instances on the same machine to share an answer log, implement a custom store backed by a database or a shared network path instead.
+  `fileStore` throws if another process already holds the lock file for that folder. The first process to open the folder keeps it exclusively; subsequent processes fall back to `memoryStore` with one log line. More broadly, if the folder cannot be opened for any reason — it is read-only, the path is invalid, or another process holds the lock — `shadow()` in Node catches the error and falls back to `memoryStore`, logging one error line so you know answers are staying in memory. This prevents two concurrent trims from racing and losing answers. If you need multiple instances on the same machine to share an answer log, implement a custom store backed by a database or a shared network path instead.
 </Warning>

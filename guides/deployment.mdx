@@ -1,5 +1,5 @@
 ---
-title: "Deploy TinyDecide in Production"
+title: "Deploy TinyDecide in Production: Servers and Serverless"
 sidebarTitle: "Deployment"
 description: "Deploy TinyDecide across single-server, multi-instance, serverless, and container setups with persistence, shared stores, and compiled models."
 ---
@@ -23,9 +23,8 @@ TinyDecide works in three deployment topologies, each with a different persisten
 
     If a process manager runs several copies of your app (`pm2 -i 4`, `cluster.fork()`), only the first worker to open the folder keeps it. The others fall back to memory automatically and log one line:
 
-    ```
-    [tinydecide] support: Error opening .tinydecide/support: .tinydecide/support is in use by process 12345.
-    Use one process per folder, or delete .tinydecide/support/lock if that process is not using it. Answers stay in memory.
+    ```text
+    [tinydecide] support: opening .tinydecide/support failed: .tinydecide/support is in use by process 12345. Use one process per folder, or delete .tinydecide/support/lock if that process is not using it. Answers stay in memory.
     ```
 
     The worker that holds the folder compiles and saves the model. When the others restart (after a deploy, for example) they load the saved model immediately from the folder. During their session they log answers in memory only; those answers are not merged back. If that tradeoff matters, use the multi-instance pattern instead.
@@ -96,7 +95,7 @@ TinyDecide works in three deployment topologies, each with a different persisten
 
 In Node, each named decision lives in one folder:
 
-```
+```text
 .tinydecide/
   .gitignore          written once: ignores the whole folder (holds raw inputs)
   support/

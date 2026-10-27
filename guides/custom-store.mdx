@@ -1,5 +1,5 @@
 ---
-title: "Use a Custom Store with TinyDecide"
+title: "Use a Custom Store to Persist TinyDecide's Answers"
 sidebarTitle: "Custom Store"
 description: "Implement a custom Store to keep TinyDecide's answers, model, and guard state in a database, S3 bucket, Redis, or any other backend."
 ---
@@ -78,7 +78,7 @@ import { memoryStore } from 'tinydecide';
 import { fileStore } from 'tinydecide'; // Node only
 ```
 
-`fileStore` accepts an optional `{ limit }` option (default 100,000) that caps how many answer rows it stores.
+`fileStore` accepts an optional `{ limit }` option (default 100,000) that caps how many answer rows it stores. On first use it also writes a `.gitignore` to the parent directory (e.g. `.tinydecide/`) that ignores the whole folder, because `answers.jsonl` holds raw inputs.
 
 ## Example: a minimal in-memory store
 

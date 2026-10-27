@@ -1,7 +1,7 @@
 ---
-title: "shadow() — Wrap Your Decision API"
+title: "shadow() — Certified Local Wrapper for Decision APIs"
 sidebarTitle: "shadow()"
-description: "Wrap any decision function and get a Decide handle back. Accepts an optional name, your api function, and ShadowOptions; returns a certified Decide."
+description: "Wraps any decision API function, learns from its answers, and compiles a certified local model to serve confident calls in microseconds."
 ---
 
 `shadow()` is the main entry point for TinyDecide. Pass it your existing API function and it returns a `Decide` handle with the same call signature — every call still goes to your API until a local model is compiled and certified, then the calls the model is confident about are answered in microseconds with agreement guaranteed.
